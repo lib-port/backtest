@@ -1,0 +1,4 @@
+# file: /home/kali/Documents/backtest/src/quant_backtester/data/csv_data_handler.py
+# hypothesis_version: 6.151.9
+
+['ask', 'bid', 'date', 'mid', 'spread_bps', 'symbol', 'volume']

@@ -1,0 +1,4 @@
+# file: /home/kali/Documents/backtest/.venv/bin/pytest
+# hypothesis_version: 6.151.9
+
+['.exe', '__main__']

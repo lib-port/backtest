@@ -1,0 +1,4 @@
+# file: /home/kali/Documents/backtest/src/quant_backtester/backtest.py
+# hypothesis_version: 6.151.9
+
+[1.0, ',', 'Backtest completed', 'Backtest started', 'MARKET', 'created_at', 'event', 'execution', 'extra', 'final_equity', 'halt_reason', 'halted', 'initial_cash', 'long_window', 'max_drawdown', 'persist', 'risk', 'run_name', 'sharpe', 'short_window', 'symbols', 'total_commission', 'total_return', 'total_slippage_cost']

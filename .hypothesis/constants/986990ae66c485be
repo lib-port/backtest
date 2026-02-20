@@ -1,0 +1,4 @@
+# file: /home/kali/Documents/backtest/src/quant_backtester/config.py
+# hypothesis_version: 6.151.9
+
+[0.0, 0.05, 0.2, 0.7, 0.8, 1.0, 2.0, 5.0, 5000.0, 10000.0, 100000.0, 100, 1000, '.json', '.yaml', '.yml', 'commission_per_trade', 'default', 'default_spread_bps', 'default_tick_volume', 'impact_bps_per_unit', 'impact_volume', 'initial_cash', 'max_drawdown_pct', 'queue_ahead_fraction', 'runs', 'stop_loss_pct', 'trade_quantity', 'utf-8']

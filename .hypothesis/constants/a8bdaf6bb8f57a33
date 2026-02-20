@@ -1,0 +1,4 @@
+# file: /home/kali/Documents/backtest/src/quant_backtester/persistence/models.py
+# hypothesis_version: 6.151.9
+
+[128, 256, 'runs']

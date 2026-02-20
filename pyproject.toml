@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-backtester-prod"
+version = "1.0.0"
+description = "Production-grade event-driven backtesting system (slippage, risk, persistence, sweeps, secure pipeline)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pandas>=2.2",
+  "numpy>=1.26",
+  "SQLAlchemy>=2.0",
+  "alembic>=1.13",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg2-binary>=2.9"]
+dev = [
+  "alembic>=1.13",
+  "pytest>=8.0",
+  "ruff>=0.6",
+  "mypy>=1.10",
+  "types-python-dateutil",
+  "hypothesis>=6.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+packages = ["quant_backtester"]
+strict = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["pandas", "yaml"]
+ignore_missing_imports = true
