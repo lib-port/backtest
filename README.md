@@ -1,4 +1,4 @@
-# quant-backtester-prod
+# Event-Driven Backtesting Platform Prototype
 
 A production-grade, event-driven backtesting system designed to be **quant-dev interview-ready**:
 
