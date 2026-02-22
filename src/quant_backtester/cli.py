@@ -16,7 +16,7 @@ from quant_backtester.config import (
     load_config_file,
 )
 from quant_backtester.logging_utils import configure_logging
-from quant_backtester.sweep import run_parameter_sweep
+from quant_backtester.sweep import run_parameter_sweep, run_walk_forward
 
 
 def _parse_symbols(s: str) -> tuple[str, ...]:
@@ -96,6 +96,16 @@ def build_parser() -> argparse.ArgumentParser:
     sweep.add_argument("--short-grid", default=None, help="Comma-separated short windows")
     sweep.add_argument("--long-grid", default=None, help="Comma-separated long windows")
     sweep.add_argument("--export-csv", default=None)
+
+    walk_forward = sub.add_parser(
+        "walk-forward", parents=[common], help="Run rolling walk-forward optimization"
+    )
+    walk_forward.add_argument("--short-grid", default=None, help="Comma-separated short windows")
+    walk_forward.add_argument("--long-grid", default=None, help="Comma-separated long windows")
+    walk_forward.add_argument("--train-days", type=int, default=None)
+    walk_forward.add_argument("--test-days", type=int, default=None)
+    walk_forward.add_argument("--step-days", type=int, default=None)
+    walk_forward.add_argument("--export-csv", default=None)
 
     return p
 
@@ -207,9 +217,32 @@ def main() -> None:
 
     short_raw: object | None = None
     long_raw: object | None = None
-    if args.cmd == "sweep":
+    train_days_raw: object | None = None
+    test_days_raw: object | None = None
+    step_days_raw: object | None = None
+    file_walk_forward = file_cfg.get("walk_forward", {})
+    if file_walk_forward and not isinstance(file_walk_forward, dict):
+        parser.error("'walk_forward' in config file must be a mapping")
+
+    if args.cmd in {"sweep", "walk-forward"}:
         short_raw = _pick(args.short_grid, file_cfg.get("short_grid"), "10,20,30")
         long_raw = _pick(args.long_grid, file_cfg.get("long_grid"), "50,100,150")
+    if args.cmd == "walk-forward":
+        train_days_raw = _pick(
+            args.train_days,
+            file_walk_forward.get("train_days") if isinstance(file_walk_forward, dict) else None,
+            252,
+        )
+        test_days_raw = _pick(
+            args.test_days,
+            file_walk_forward.get("test_days") if isinstance(file_walk_forward, dict) else None,
+            63,
+        )
+        step_days_raw = _pick(
+            args.step_days,
+            file_walk_forward.get("step_days") if isinstance(file_walk_forward, dict) else None,
+            21,
+        )
 
     if args.dry_run:
         effective_config: dict[str, object] = {
@@ -233,6 +266,15 @@ def main() -> None:
             effective_config["long_grid"] = long_raw
             effective_config["export_csv"] = args.export_csv or str(
                 Path(cfg.out_dir) / "sweep_results.csv"
+            )
+        if args.cmd == "walk-forward":
+            effective_config["short_grid"] = short_raw
+            effective_config["long_grid"] = long_raw
+            effective_config["train_days"] = train_days_raw
+            effective_config["test_days"] = test_days_raw
+            effective_config["step_days"] = step_days_raw
+            effective_config["export_csv"] = args.export_csv or str(
+                Path(cfg.out_dir) / "walk_forward_results.csv"
             )
 
         print("Config valid.")
@@ -271,6 +313,48 @@ def main() -> None:
         df = run_parameter_sweep(cfg, short_grid, long_grid, export_csv=args.export_csv)
         print(df.head(10).to_string(index=False))
         print(f"Saved sweep CSV to: {args.export_csv or (Path(cfg.out_dir) / 'sweep_results.csv')}")
+        return
+
+    if args.cmd == "walk-forward":
+        assert short_raw is not None
+        assert long_raw is not None
+        assert train_days_raw is not None
+        assert test_days_raw is not None
+        assert step_days_raw is not None
+        try:
+            if isinstance(short_raw, list):
+                short_grid = [int(x) for x in short_raw]
+            else:
+                short_grid = _parse_grid(str(short_raw))
+            if isinstance(long_raw, list):
+                long_grid = [int(x) for x in long_raw]
+            else:
+                long_grid = _parse_grid(str(long_raw))
+            train_days = int(train_days_raw)
+            test_days = int(test_days_raw)
+            step_days = int(step_days_raw)
+        except ValueError as exc:
+            parser.error(f"Invalid walk-forward config: {exc}")
+
+        df, summary = run_walk_forward(
+            cfg,
+            short_grid,
+            long_grid,
+            train_days=train_days,
+            test_days=test_days,
+            step_days=step_days,
+            export_csv=args.export_csv,
+        )
+        if df.empty:
+            print("No walk-forward windows produced.")
+        else:
+            print(df.head(10).to_string(index=False))
+        print("Walk-forward summary:")
+        for key, value in summary.items():
+            print(f"{key}: {value}")
+        print(
+            f"Saved walk-forward CSV to: {args.export_csv or (Path(cfg.out_dir) / 'walk_forward_results.csv')}"
+        )
         return
 
     raise SystemExit("Unknown command")

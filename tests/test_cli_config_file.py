@@ -92,3 +92,41 @@ def test_cli_run_dry_run_reports_persist_false(tmp_path: Path) -> None:
     assert proc.returncode == 0
     payload = json.loads("\n".join(proc.stdout.splitlines()[1:]))
     assert payload["persist"] is False
+
+
+def test_cli_walk_forward_dry_run_with_config(tmp_path: Path) -> None:
+    cfg = {
+        "symbols": ["AAPL", "MSFT"],
+        "csv_path": "data/sample_prices.csv",
+        "run_name": "cfg-wf",
+        "out_dir": str(tmp_path / "runs"),
+        "database_url": f"sqlite:///{tmp_path / 'runs.db'}",
+        "short_grid": [5, 10],
+        "long_grid": [20, 30],
+        "walk_forward": {"train_days": 30, "test_days": 15, "step_days": 10},
+    }
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(cfg), encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "quant_backtester.cli",
+            "walk-forward",
+            "--config",
+            str(p),
+            "--dry-run",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0
+    payload = json.loads("\n".join(proc.stdout.splitlines()[1:]))
+    assert payload["cmd"] == "walk-forward"
+    assert payload["train_days"] == 30
+    assert payload["test_days"] == 15
+    assert payload["step_days"] == 10
+    assert payload["short_grid"] == [5, 10]
+    assert payload["long_grid"] == [20, 30]

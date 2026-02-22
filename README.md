@@ -68,6 +68,7 @@ Terraform AWS template:
 
 - `run`: single backtest
 - `sweep`: parameter grid search; writes results to DB and exports a CSV summary
+- `walk-forward`: rolling train/test optimization; writes out-of-sample runs to DB and exports a CSV report
 - `--config`: load config from `.json`/`.yml`/`.yaml`
 - `--dry-run`: validate effective config and exit
 - `--no-persist`: run backtest without writing rows to DB
@@ -85,8 +86,15 @@ Example config file (`config.json`):
   "symbols": ["AAPL", "MSFT"],
   "csv_path": "data/sample_prices.csv",
   "run_name": "cfg-run",
+  "short_grid": [5, 10, 20],
+  "long_grid": [30, 50, 100],
   "short_window": 5,
   "long_window": 10,
+  "walk_forward": {
+    "train_days": 252,
+    "test_days": 63,
+    "step_days": 21
+  },
   "execution": {
     "rng_seed": 123
   }
@@ -98,6 +106,8 @@ Use it:
 ```bash
 python -m quant_backtester.cli run --config config.json --dry-run
 python -m quant_backtester.cli run --config config.json
+python -m quant_backtester.cli walk-forward --config config.json
+python -m quant_backtester.cli walk-forward --csv data/sample_prices.csv --symbols AAPL,MSFT --short-grid 5,10,20 --long-grid 30,50,100 --train-days 252 --test-days 63 --step-days 21
 ```
 
 ## Next upgrades
