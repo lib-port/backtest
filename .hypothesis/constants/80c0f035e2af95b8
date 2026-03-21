@@ -1,0 +1,4 @@
+# file: /home/kali/Documents/backtest/src/quant_backtester/execution/simulated_execution.py
+# hypothesis_version: 6.151.9
+
+[0.0, 0.5, 1.0, 10000.0, 'BUY', 'LIMIT']

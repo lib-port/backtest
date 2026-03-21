@@ -1,0 +1,4 @@
+# file: /home/kali/Documents/backtest/src/quant_backtester/sweep.py
+# hypothesis_version: 6.151.9
+
+[500, 'Sweep completed', 'Sweep started', 'created_at', 'event', 'export_csv', 'extra', 'final_equity', 'halt_reason', 'halted', 'initial_cash', 'long_grid_size', 'long_window', 'long_windows', 'max_drawdown', 'run_count', 'run_name', 'sharpe', 'short_grid_size', 'short_window', 'short_windows', 'sweep_results.csv', 'symbols', 'total_commission', 'total_return', 'total_slippage_cost']

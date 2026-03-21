@@ -1,0 +1,4 @@
+# file: /home/kali/Documents/backtest/src/quant_backtester/events.py
+# hypothesis_version: 6.151.9
+
+['BUY', 'LIMIT', 'MARKET', 'SELL']
