@@ -1,11 +1,74 @@
-output "db_endpoint" {
-  value = aws_db_instance.db.address
+output "api_base_url" {
+  description = "Public HTTPS base URL. If route53_zone_id is omitted, create this DNS alias externally."
+  value       = "https://${var.api_hostname}"
 }
 
-output "db_port" {
-  value = aws_db_instance.db.port
+output "load_balancer_dns_name" {
+  value = aws_lb.api.dns_name
 }
 
-output "secret_arn" {
-  value = aws_secretsmanager_secret.db.arn
+output "ecs_cluster_name" {
+  value = aws_ecs_cluster.this.name
+}
+
+output "api_service_name" {
+  value = aws_ecs_service.api.name
+}
+
+output "worker_service_name" {
+  value = aws_ecs_service.worker.name
+}
+
+output "migration_task_definition_arn" {
+  description = "Run this task in the private subnets before deploying new API and worker revisions."
+  value       = aws_ecs_task_definition.migration.arn
+}
+
+output "private_subnet_ids" {
+  value = aws_subnet.private[*].id
+}
+
+output "application_security_group_id" {
+  value = aws_security_group.app.id
+}
+
+output "database_endpoint" {
+  value = aws_db_instance.database.address
+}
+
+output "database_port" {
+  value = aws_db_instance.database.port
+}
+
+output "database_master_secret_arn" {
+  value     = aws_db_instance.database.master_user_secret[0].secret_arn
+  sensitive = true
+}
+
+output "artifact_bucket_name" {
+  value = aws_s3_bucket.artifacts.id
+}
+
+output "dataset_bucket_name" {
+  value = aws_s3_bucket.datasets.id
+}
+
+output "job_queue_url" {
+  value = aws_sqs_queue.jobs.url
+}
+
+output "job_dead_letter_queue_url" {
+  value = aws_sqs_queue.dead_letter.url
+}
+
+output "ecr_repository_url" {
+  value = aws_ecr_repository.app.repository_url
+}
+
+output "kms_key_arn" {
+  value = aws_kms_key.data.arn
+}
+
+output "operations_dashboard_name" {
+  value = aws_cloudwatch_dashboard.operations.dashboard_name
 }

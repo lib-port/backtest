@@ -3,14 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from quant_backtester.backtest import run_backtest
 from quant_backtester.config import (
     BacktestConfig,
+    DataConfig,
+    DuplicatePolicy,
     ExecutionConfig,
+    MetricsConfig,
     MicrostructureConfig,
     RiskConfig,
     load_config_file,
@@ -39,6 +41,18 @@ def _pick(cli_value: Any, file_value: Any, default_value: Any) -> Any:
     if file_value is not None:
         return file_value
     return default_value
+
+
+def _as_int(value: object, *, name: str) -> int:
+    if isinstance(value, (int, float, str)):
+        return int(value)
+    raise ValueError(f"{name} must be an integer")
+
+
+def _as_float(value: object, *, name: str) -> float:
+    if isinstance(value, (int, float, str)):
+        return float(value)
+    raise ValueError(f"{name} must be numeric")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -87,6 +101,14 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--max-pos", type=int, default=None)
     common.add_argument("--stop-loss", type=float, default=None)
     common.add_argument("--max-dd", type=float, default=None)
+    common.add_argument("--max-gross-exposure", type=float, default=None)
+    common.add_argument("--max-leverage", type=float, default=None)
+
+    # data and metric assumptions
+    common.add_argument("--source-timezone", default=None)
+    common.add_argument("--duplicate-policy", choices=("error", "last"), default=None)
+    common.add_argument("--periods-per-year", type=float, default=None)
+    common.add_argument("--risk-free-rate", type=float, default=None)
 
     run = sub.add_parser("run", parents=[common], help="Run a single backtest")
     run.add_argument("--short", type=int, default=None)
@@ -105,6 +127,10 @@ def build_parser() -> argparse.ArgumentParser:
     walk_forward.add_argument("--train-days", type=int, default=None)
     walk_forward.add_argument("--test-days", type=int, default=None)
     walk_forward.add_argument("--step-days", type=int, default=None)
+    walk_forward.add_argument("--purge-days", type=int, default=None)
+    walk_forward.add_argument("--embargo-days", type=int, default=None)
+    walk_forward.add_argument("--warmup-days", type=int, default=None)
+    walk_forward.add_argument("--allow-test-overlap", action="store_true")
     walk_forward.add_argument("--export-csv", default=None)
 
     return p
@@ -125,12 +151,18 @@ def main() -> None:
     file_exec = file_cfg.get("execution", {})
     file_micro = file_exec.get("micro", {}) if isinstance(file_exec, dict) else {}
     file_risk = file_cfg.get("risk", {})
+    file_data = file_cfg.get("data", {})
+    file_metrics = file_cfg.get("metrics", {})
     if not isinstance(file_exec, dict):
         parser.error("'execution' in config file must be a mapping")
     if not isinstance(file_micro, dict):
         parser.error("'execution.micro' in config file must be a mapping")
     if not isinstance(file_risk, dict):
         parser.error("'risk' in config file must be a mapping")
+    if not isinstance(file_data, dict):
+        parser.error("'data' in config file must be a mapping")
+    if not isinstance(file_metrics, dict):
+        parser.error("'metrics' in config file must be a mapping")
 
     symbols = args.symbols
     if symbols is None:
@@ -187,12 +219,62 @@ def main() -> None:
             ),
             stop_loss_pct=float(_pick(args.stop_loss, file_risk.get("stop_loss_pct"), 0.05)),
             max_drawdown_pct=float(_pick(args.max_dd, file_risk.get("max_drawdown_pct"), 0.20)),
+            max_gross_exposure=(
+                None
+                if _pick(
+                    args.max_gross_exposure,
+                    file_risk.get("max_gross_exposure"),
+                    None,
+                )
+                is None
+                else float(
+                    _pick(
+                        args.max_gross_exposure,
+                        file_risk.get("max_gross_exposure"),
+                        None,
+                    )
+                )
+            ),
+            max_leverage=float(_pick(args.max_leverage, file_risk.get("max_leverage"), 1.0)),
+        )
+        data_cfg = DataConfig(
+            source_timezone=str(
+                _pick(args.source_timezone, file_data.get("source_timezone"), "UTC")
+            ),
+            duplicate_policy=cast(
+                DuplicatePolicy,
+                str(_pick(args.duplicate_policy, file_data.get("duplicate_policy"), "error")),
+            ),
+            chunksize=int(file_data.get("chunksize", 50_000)),
+            require_sorted=bool(file_data.get("require_sorted", True)),
+            max_events=int(file_data.get("max_events", 2_000_000)),
+        )
+        raw_periods = _pick(
+            args.periods_per_year,
+            file_metrics.get("periods_per_year"),
+            None,
+        )
+        metrics_cfg = MetricsConfig(
+            annual_risk_free_rate=float(
+                _pick(
+                    args.risk_free_rate,
+                    file_metrics.get("annual_risk_free_rate"),
+                    0.0,
+                )
+            ),
+            periods_per_year=None if raw_periods is None else float(raw_periods),
         )
     except (TypeError, ValueError) as exc:
         parser.error(f"Invalid execution/risk config: {exc}")
 
-    short_window = int(_pick(getattr(args, "short", None), file_cfg.get("short_window"), 20))
-    long_window = int(_pick(getattr(args, "long", None), file_cfg.get("long_window"), 50))
+    short_window = _as_int(
+        _pick(getattr(args, "short", None), file_cfg.get("short_window"), 20),
+        name="short_window",
+    )
+    long_window = _as_int(
+        _pick(getattr(args, "long", None), file_cfg.get("long_window"), 50),
+        name="long_window",
+    )
     try:
         cfg = BacktestConfig(
             symbols=symbols,
@@ -207,19 +289,26 @@ def main() -> None:
             run_name=str(run_name),
             out_dir=str(out_dir),
             database_url=str(db_url),
+            max_persisted_equity_points=_as_int(
+                file_cfg.get("max_persisted_equity_points", 100_000),
+                name="max_persisted_equity_points",
+            ),
             execution=exec_cfg,
             risk=risk_cfg,
+            data=data_cfg,
+            metrics=metrics_cfg,
         )
     except ValueError as exc:
         parser.error(str(exc))
-
-    Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
 
     short_raw: object | None = None
     long_raw: object | None = None
     train_days_raw: object | None = None
     test_days_raw: object | None = None
     step_days_raw: object | None = None
+    purge_days_raw: object | None = None
+    embargo_days_raw: object | None = None
+    warmup_days_raw: object | None = None
     file_walk_forward = file_cfg.get("walk_forward", {})
     if file_walk_forward and not isinstance(file_walk_forward, dict):
         parser.error("'walk_forward' in config file must be a mapping")
@@ -241,26 +330,28 @@ def main() -> None:
         step_days_raw = _pick(
             args.step_days,
             file_walk_forward.get("step_days") if isinstance(file_walk_forward, dict) else None,
-            21,
+            63,
+        )
+        purge_days_raw = _pick(
+            args.purge_days,
+            file_walk_forward.get("purge_days") if isinstance(file_walk_forward, dict) else None,
+            0,
+        )
+        embargo_days_raw = _pick(
+            args.embargo_days,
+            file_walk_forward.get("embargo_days") if isinstance(file_walk_forward, dict) else None,
+            0,
+        )
+        warmup_days_raw = _pick(
+            args.warmup_days,
+            file_walk_forward.get("warmup_days") if isinstance(file_walk_forward, dict) else None,
+            None,
         )
 
     if args.dry_run:
-        effective_config: dict[str, object] = {
-            "cmd": str(args.cmd),
-            "symbols": list(cfg.symbols),
-            "initial_cash": cfg.initial_cash,
-            "trade_quantity": cfg.trade_quantity,
-            "commission_per_trade": cfg.commission_per_trade,
-            "short_window": cfg.short_window,
-            "long_window": cfg.long_window,
-            "csv_path": cfg.csv_path,
-            "run_name": cfg.run_name,
-            "out_dir": cfg.out_dir,
-            "database_url": cfg.database_url,
-            "persist": not bool(args.no_persist),
-            "execution": asdict(cfg.execution),
-            "risk": asdict(cfg.risk),
-        }
+        effective_config = cfg.to_dict(redact_secrets=True)
+        effective_config["cmd"] = str(args.cmd)
+        effective_config["persist"] = not bool(args.no_persist)
         if args.cmd == "sweep":
             effective_config["short_grid"] = short_raw
             effective_config["long_grid"] = long_raw
@@ -273,6 +364,10 @@ def main() -> None:
             effective_config["train_days"] = train_days_raw
             effective_config["test_days"] = test_days_raw
             effective_config["step_days"] = step_days_raw
+            effective_config["purge_days"] = purge_days_raw
+            effective_config["embargo_days"] = embargo_days_raw
+            effective_config["warmup_days"] = warmup_days_raw
+            effective_config["allow_test_overlap"] = bool(args.allow_test_overlap)
             effective_config["export_csv"] = args.export_csv or str(
                 Path(cfg.out_dir) / "walk_forward_results.csv"
             )
@@ -310,7 +405,13 @@ def main() -> None:
                 long_grid = _parse_grid(str(long_raw))
         except ValueError as exc:
             parser.error(f"Invalid sweep grid: {exc}")
-        df = run_parameter_sweep(cfg, short_grid, long_grid, export_csv=args.export_csv)
+        df = run_parameter_sweep(
+            cfg,
+            short_grid,
+            long_grid,
+            export_csv=args.export_csv,
+            persist=not bool(args.no_persist),
+        )
         print(df.head(10).to_string(index=False))
         print(f"Saved sweep CSV to: {args.export_csv or (Path(cfg.out_dir) / 'sweep_results.csv')}")
         return
@@ -321,6 +422,8 @@ def main() -> None:
         assert train_days_raw is not None
         assert test_days_raw is not None
         assert step_days_raw is not None
+        assert purge_days_raw is not None
+        assert embargo_days_raw is not None
         try:
             if isinstance(short_raw, list):
                 short_grid = [int(x) for x in short_raw]
@@ -330,9 +433,14 @@ def main() -> None:
                 long_grid = [int(x) for x in long_raw]
             else:
                 long_grid = _parse_grid(str(long_raw))
-            train_days = int(train_days_raw)
-            test_days = int(test_days_raw)
-            step_days = int(step_days_raw)
+            train_days = _as_int(train_days_raw, name="train_days")
+            test_days = _as_int(test_days_raw, name="test_days")
+            step_days = _as_int(step_days_raw, name="step_days")
+            purge_days = _as_int(purge_days_raw, name="purge_days")
+            embargo_days = _as_int(embargo_days_raw, name="embargo_days")
+            warmup_days = (
+                None if warmup_days_raw is None else _as_int(warmup_days_raw, name="warmup_days")
+            )
         except ValueError as exc:
             parser.error(f"Invalid walk-forward config: {exc}")
 
@@ -344,6 +452,11 @@ def main() -> None:
             test_days=test_days,
             step_days=step_days,
             export_csv=args.export_csv,
+            purge_days=purge_days,
+            embargo_days=embargo_days,
+            warmup_days=warmup_days,
+            allow_test_overlap=bool(args.allow_test_overlap),
+            persist=not bool(args.no_persist),
         )
         if df.empty:
             print("No walk-forward windows produced.")

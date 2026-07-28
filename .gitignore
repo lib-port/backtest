@@ -2,8 +2,11 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.hypothesis/
 .mypy_cache/
 .ruff_cache/
+.coverage.*
+htmlcov/
 dist/
 build/
 *.egg-info/
@@ -20,3 +23,7 @@ runs/*.sqlite
 runs/*.sqlite3
 .coverage
 coverage.xml
+.env
+!.env.example
+*.log
+artifacts/

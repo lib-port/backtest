@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+import os
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
-from sqlalchemy import create_engine
-from sqlalchemy.engine import Engine
+from sqlalchemy import Engine, create_engine, event, inspect, select, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from quant_backtester.persistence.models import Base, Run
+
+EXPECTED_SCHEMA_REVISION = "0005"
 
 
 @dataclass
@@ -18,21 +23,151 @@ class Database:
 
     def engine(self) -> Engine:
         if self._engine is None:
-            self._engine = create_engine(self.url, future=True)
+            backend = make_url(self.url).get_backend_name()
+            connect_args: dict[str, object] = {}
+            engine_options: dict[str, object] = {
+                "future": True,
+                "pool_pre_ping": True,
+            }
+            if backend == "sqlite":
+                connect_args["check_same_thread"] = False
+                connect_args["timeout"] = 30
+            else:
+                pool_size = int(os.getenv("QBT_DB_POOL_SIZE", "5"))
+                max_overflow = int(os.getenv("QBT_DB_MAX_OVERFLOW", "5"))
+                if not 1 <= pool_size <= 100 or not 0 <= max_overflow <= 100:
+                    raise ValueError("Database pool settings are outside safe bounds")
+                connect_args["connect_timeout"] = 10
+                connect_args["application_name"] = "quant-backtester"
+                engine_options.update(
+                    {
+                        "pool_size": pool_size,
+                        "max_overflow": max_overflow,
+                        "pool_timeout": 10,
+                        "pool_recycle": 1_800,
+                    }
+                )
+            self._engine = create_engine(
+                self.url,
+                connect_args=connect_args,
+                **engine_options,
+            )
+            if backend == "sqlite":
+                event.listen(self._engine, "connect", _configure_sqlite)
         return self._engine
 
+    @property
+    def is_sqlite(self) -> bool:
+        return make_url(self.url).get_backend_name() == "sqlite"
+
+    def prepare_schema(self) -> None:
+        """Create local schemas, but require Alembic-managed production databases."""
+        if self.is_sqlite or os.getenv("QBT_AUTO_CREATE_SCHEMA", "").lower() == "true":
+            self.create_tables()
+            return
+        if not inspect(self.engine()).has_table("alembic_version"):
+            raise RuntimeError(
+                "Database schema is not initialized. Run `alembic upgrade head` before startup."
+            )
+        with self.engine().connect() as connection:
+            revisions = set(
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalars()
+            )
+        if revisions != {EXPECTED_SCHEMA_REVISION}:
+            found = ", ".join(sorted(revisions)) or "none"
+            raise RuntimeError(
+                f"Database schema revision is {found}; expected {EXPECTED_SCHEMA_REVISION}. "
+                "Run `alembic upgrade head` before startup."
+            )
+
     def create_tables(self) -> None:
-        eng = self.engine()
-        Base.metadata.create_all(eng)
+        Base.metadata.create_all(self.engine())
 
     def session(self) -> Session:
         if self._session_factory is None:
-            self._session_factory = sessionmaker(bind=self.engine(), future=True)
+            self._session_factory = sessionmaker(
+                bind=self.engine(),
+                future=True,
+                expire_on_commit=False,
+            )
         return self._session_factory()
+
+    @contextmanager
+    def transaction(self) -> Iterator[Session]:
+        with self.session() as session:
+            with session.begin():
+                yield session
+
+    def insert_run(self, run: Run) -> Run:
+        with self.transaction() as session:
+            existing = session.scalar(select(Run).where(Run.run_id == run.run_id))
+            if existing is not None:
+                if existing.result_hash == run.result_hash:
+                    return existing
+                raise ValueError(f"run_id {run.run_id!r} already contains a different result")
+            session.add(run)
+        return run
 
     def insert_runs_bulk(self, runs: Sequence[Run]) -> None:
         if not runs:
             return
-        with self.session() as s:
-            s.add_all(runs)
-            s.commit()
+        try:
+            with self.transaction() as session:
+                for run in runs:
+                    existing = session.scalar(select(Run).where(Run.run_id == run.run_id))
+                    if existing is None:
+                        session.add(run)
+                    elif existing.result_hash != run.result_hash:
+                        raise ValueError(
+                            f"run_id {run.run_id!r} already contains a different result"
+                        )
+        except IntegrityError as exc:
+            raise ValueError("Run persistence violated a uniqueness constraint") from exc
+
+    def get_run(self, run_id: str, *, tenant_id: str = "default") -> Run | None:
+        with self.session() as session:
+            return session.scalar(
+                select(Run).where(Run.run_id == run_id, Run.tenant_id == tenant_id)
+            )
+
+    def list_runs(
+        self,
+        *,
+        tenant_id: str = "default",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Run]:
+        if not 1 <= limit <= 1_000:
+            raise ValueError("limit must be in [1, 1000]")
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
+        with self.session() as session:
+            rows = session.scalars(
+                select(Run)
+                .where(Run.tenant_id == tenant_id)
+                .order_by(Run.created_at.desc(), Run.id.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+            return list(rows)
+
+    def ping(self) -> bool:
+        try:
+            with self.engine().connect() as connection:
+                connection.execute(text("SELECT 1"))
+            return True
+        except Exception:
+            return False
+
+    def close(self) -> None:
+        if self._engine is not None:
+            self._engine.dispose()
+
+
+def _configure_sqlite(dbapi_connection: object, _connection_record: object) -> None:
+    cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+    finally:
+        cursor.close()

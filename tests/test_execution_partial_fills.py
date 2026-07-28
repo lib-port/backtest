@@ -20,14 +20,18 @@ def test_market_order_partially_fills_across_ticks() -> None:
     ex = SimulatedExecutionHandler(commission_per_trade=0.0, cfg=cfg, rng_seed=1)
     ts = datetime(2020, 1, 1)
     mkt = MarketEvent(timestamp=ts, symbol="AAPL", mid=100.0, spread_bps=0.0, volume=100.0)
-    ex.submit(OrderEvent(timestamp=ts, symbol="AAPL", side=Side.BUY, quantity=120))
+    order_id = ex.submit(OrderEvent(timestamp=ts, symbol="AAPL", side=Side.BUY, quantity=120))
 
     fills1 = ex.on_market(mkt)
+    assert ex.remaining_quantity(order_id) == 70
     fills2 = ex.on_market(mkt)
+    assert ex.remaining_quantity(order_id) == 20
     fills3 = ex.on_market(mkt)
 
     total_qty = sum(f.quantity for f in [*fills1, *fills2, *fills3])
     assert total_qty == 120
+    assert all(f.order_id == order_id for f in [*fills1, *fills2, *fills3])
+    assert ex.remaining_quantity(order_id) is None
 
 
 def test_commission_charged_once_for_partially_filled_order() -> None:

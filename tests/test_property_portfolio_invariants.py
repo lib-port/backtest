@@ -35,6 +35,7 @@ def test_equity_matches_cash_plus_mark_to_market(
     ts = datetime(2020, 1, 1)
 
     for side, qty, px, commission in fills:
+        pf.update_market_price(symbol, px)
         pf.on_fill(
             FillEvent(
                 timestamp=ts,
@@ -46,8 +47,10 @@ def test_equity_matches_cash_plus_mark_to_market(
                 slippage=0.0,
             )
         )
-        pf.mark_to_market(symbol, px)
+        recorded_equity = pf.snapshot_equity()
 
         pos = pf.get_position(symbol)
         expected = pf.cash + (pos.quantity * px)
         assert abs(pf.equity() - expected) < 1e-6
+        assert recorded_equity == pf.equity_curve[-1]
+        assert abs(recorded_equity - pf.equity()) < 1e-6
