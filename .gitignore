@@ -27,3 +27,4 @@ coverage.xml
 !.env.example
 *.log
 artifacts/
+.codex/

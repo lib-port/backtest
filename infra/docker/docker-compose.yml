@@ -12,20 +12,24 @@ x-app: &app
   user: "10001:10001"
   read_only: true
   tmpfs:
-    - /tmp:size=128m,mode=1777
+    - /tmp:size=512m,mode=1777,noexec,nosuid
   security_opt:
     - no-new-privileges:true
   cap_drop:
     - ALL
   restart: unless-stopped
+  stop_grace_period: 2m
   environment: &app-environment
-    DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-quant}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-quantdb}
     QBT_ENVIRONMENT: development
-    QBT_AUTH_MODE: ${QBT_AUTH_MODE:-api-key}
-    QBT_API_KEYS_JSON: ${QBT_API_KEYS_JSON:?Set QBT_API_KEYS_JSON}
     QBT_DATA_ROOT: /app
     QBT_ARTIFACT_ROOT: /app/runs
     QBT_LOG_LEVEL: ${QBT_LOG_LEVEL:-INFO}
+    QBT_REQUIRE_STRICT_DATASET_SCHEMA: "true"
+    QBT_MAX_DATASET_BYTES: "250000000"
+    QBT_MAX_SYMBOLS_PER_RUN: "250"
+    QBT_MAX_EVENTS_PER_RUN: "2000000"
+    QBT_MAX_UNSORTED_EVENTS_PER_RUN: "250000"
+    QBT_MAX_PERSISTED_EQUITY_POINTS: "100000"
   volumes:
     - ../../data:/app/data:ro
     - artifacts:/app/runs
@@ -41,7 +45,7 @@ services:
   postgres:
     image: postgres:16.13-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-quant}
+      POSTGRES_USER: ${POSTGRES_USER:-quant_owner}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-quantdb}
     volumes:
@@ -49,7 +53,11 @@ services:
     networks:
       - backend
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-quant} -d ${POSTGRES_DB:-quantdb}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-quant_owner} -d ${POSTGRES_DB:-quantdb}",
+        ]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -59,19 +67,35 @@ services:
 
   migrate:
     <<: *app
-    command: ["python", "-m", "alembic", "upgrade", "head"]
+    command:
+      [
+        "sh",
+        "-ceu",
+        "python -m alembic upgrade head && quant-backtester-db-bootstrap --role api && quant-backtester-db-bootstrap --role worker",
+      ]
     restart: "no"
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       <<: *app-environment
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-quant_owner}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-quantdb}
       QBT_AUTH_MODE: disabled
       QBT_API_KEYS_JSON: "[]"
+      QBT_API_DB_USERNAME: ${QBT_API_DB_USERNAME:-quant_api}
+      QBT_API_DB_PASSWORD: ${QBT_API_DB_PASSWORD:?Set QBT_API_DB_PASSWORD}
+      QBT_WORKER_DB_USERNAME: ${QBT_WORKER_DB_USERNAME:-quant_worker}
+      QBT_WORKER_DB_PASSWORD: ${QBT_WORKER_DB_PASSWORD:?Set QBT_WORKER_DB_PASSWORD}
 
   api:
     <<: *app
     command: ["quant-backtester-api", "--json-logs"]
+    environment:
+      <<: *app-environment
+      DATABASE_URL: postgresql+psycopg://${QBT_API_DB_USERNAME:-quant_api}:${QBT_API_DB_PASSWORD:?Set QBT_API_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-quantdb}
+      QBT_AUTH_MODE: ${QBT_AUTH_MODE:-api-key}
+      QBT_API_KEYS_JSON: ${QBT_API_KEYS_JSON:?Set QBT_API_KEYS_JSON}
+      QBT_API_KEY_PEPPER: ${QBT_API_KEY_PEPPER:-}
     ports:
       - "127.0.0.1:${QBT_API_PORT:-8000}:8000"
     healthcheck:
@@ -89,10 +113,19 @@ services:
   worker:
     <<: *app
     command: ["quant-backtester-worker", "--json-logs"]
+    environment:
+      <<: *app-environment
+      DATABASE_URL: postgresql+psycopg://${QBT_WORKER_DB_USERNAME:-quant_worker}:${QBT_WORKER_DB_PASSWORD:?Set QBT_WORKER_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-quantdb}
+      QBT_MAX_RUN_SECONDS: "3600"
+      QBT_JOB_LEASE_SECONDS: "30"
     deploy:
       replicas: ${QBT_WORKER_REPLICAS:-1}
     healthcheck:
-      disable: true
+      test: ["CMD", "quant-backtester-worker", "--healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
 volumes:
   pgdata:

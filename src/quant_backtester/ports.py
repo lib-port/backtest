@@ -11,6 +11,8 @@ class MarketDataSource(Protocol):
 
 
 class Strategy(Protocol):
+    def warmup(self, event: MarketEvent) -> None: ...
+
     def on_market(self, event: MarketEvent) -> SignalEvent | None: ...
 
 

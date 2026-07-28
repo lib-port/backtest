@@ -82,7 +82,8 @@ def test_final_tick_fill_is_included_in_reported_equity(
     assert result["max_drawdown"] == pytest.approx(0.00101)
 
     extra = cast(dict[str, object], result["extra"])
-    assert extra["pending_order_count"] == 1
+    assert extra["pending_order_count"] == 0
+    assert extra["end_canceled_order_count"] == 1
 
 
 @pytest.mark.parametrize(

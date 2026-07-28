@@ -37,9 +37,16 @@ jobs:
       - run: python -m ruff format --check .
       - run: python -m ruff check .
       - run: python -m mypy
-      - run: python -m pytest --cov=quant_backtester --cov-report=term-missing --cov-report=xml
+      - run: python -m pytest --cov=quant_backtester --cov-branch --cov-report=term-missing --cov-report=xml
         env:
           HYPOTHESIS_STORAGE_DIRECTORY: /tmp/quant-backtester-hypothesis
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: matrix.python-version == '3.13'
+        with:
+          name: coverage
+          path: coverage.xml
+          if-no-files-found: error
+          retention-days: 30
 
   migrations:
     runs-on: ubuntu-latest
@@ -67,6 +74,7 @@ jobs:
           python-version: "3.13"
           cache: pip
       - run: python -m pip install --requirement requirements/runtime.lock
+      - run: python -m pip install "pytest==9.0.2"
       - run: python -m pip install --no-deps -e .
       - run: python -m alembic upgrade head
         env:
@@ -83,6 +91,10 @@ jobs:
       - run: python -m alembic check
         env:
           DATABASE_URL: postgresql+psycopg://quant:test-only@localhost:5432/quantdb
+      - name: Runtime database role and RLS integration
+        run: python -m pytest tests/test_postgres_security_integration.py
+        env:
+          QBT_TEST_POSTGRES_URL: postgresql+psycopg://quant:test-only@localhost:5432/quantdb
 
   package:
     runs-on: ubuntu-latest
@@ -150,6 +162,9 @@ jobs:
         run: docker compose --env-file .env.ci -f infra/docker/docker-compose.yml config --quiet
         env:
           POSTGRES_PASSWORD: ci-only-password
+          QBT_API_DB_PASSWORD: ci-only-api-password-at-least-24
+          QBT_WORKER_DB_PASSWORD: ci-only-worker-password-at-least-24
+          QBT_API_KEY_PEPPER: ci-only-api-key-pepper-value-32
           QBT_API_KEYS_JSON: '[{"token_sha256":"d1ab2873918d9bd28b4d70174ca92a3a456b2a0eef335acbf3234b9c4680e4a7","actor_id":"ci","tenant_id":"default","role":"admin"}]'
 
   container:
@@ -204,3 +219,4 @@ jobs:
           name: quant-backtester-sbom
           path: artifacts/quant-backtester.cdx.json
           if-no-files-found: error
+          retention-days: 90

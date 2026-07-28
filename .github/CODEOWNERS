@@ -1,0 +1,8 @@
+# Default review ownership. Add specialist teams as the project grows.
+* @libport
+
+# Security- and compatibility-sensitive boundaries require repository-owner review.
+/alembic/ @libport
+/infra/ @libport
+/src/quant_backtester/persistence/ @libport
+/src/quant_backtester/service/ @libport

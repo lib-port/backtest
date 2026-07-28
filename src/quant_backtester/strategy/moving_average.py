@@ -29,6 +29,18 @@ class MovingAverageCrossStrategy:
         self._last_signal: dict[str, Side | None] = {s: None for s in self.symbols}
 
     def on_market(self, event: MarketEvent) -> SignalEvent | None:
+        return self._observe(event, emit_signal=True)
+
+    def warmup(self, event: MarketEvent) -> None:
+        """Warm indicators without carrying an actionable position signal."""
+        self._observe(event, emit_signal=False)
+
+    def _observe(
+        self,
+        event: MarketEvent,
+        *,
+        emit_signal: bool,
+    ) -> SignalEvent | None:
         if event.symbol not in self._long_prices:
             return None
 
@@ -56,6 +68,8 @@ class MovingAverageCrossStrategy:
 
         short_ma = short_sum / self.short_window
         long_ma = long_sum / self.long_window
+        if not emit_signal:
+            return None
 
         last = self._last_signal[symbol]
         if short_ma > long_ma and last != Side.BUY:

@@ -9,6 +9,7 @@ from itertools import groupby
 from pathlib import Path
 from typing import Any, cast
 
+from quant_backtester.artifact_publication import publish_pending_artifacts
 from quant_backtester.config import BacktestConfig, DataConfig
 from quant_backtester.data.csv_data_handler import CSVDataHandler
 from quant_backtester.events import (
@@ -24,7 +25,6 @@ from quant_backtester.persistence.db import Database
 from quant_backtester.persistence.models import (
     EquitySnapshot,
     Run,
-    RunArtifact,
     RunFill,
     RunJournalEntry,
     RunOrder,
@@ -38,6 +38,7 @@ from quant_backtester.results import (
     build_manifest,
     canonical_json,
     new_run_id,
+    serialize_result,
 )
 from quant_backtester.strategy.moving_average import MovingAverageCrossStrategy
 from quant_backtester.utils.metrics import summarize_performance
@@ -47,6 +48,14 @@ logger = logging.getLogger(__name__)
 
 class BacktestCancelled(RuntimeError):
     pass
+
+
+def _raise_if_cancelled(
+    run_id: str,
+    cancel_requested: Callable[[], bool] | None,
+) -> None:
+    if cancel_requested is not None and cancel_requested():
+        raise BacktestCancelled(f"Backtest {run_id} was canceled")
 
 
 def _float_value(value: object) -> float:
@@ -85,7 +94,11 @@ def run_to_model(result: dict[str, object], *, tenant_id: str = "default") -> Ru
         initial_cash=_float_value(data["initial_cash"]),
         final_equity=_float_value(data["final_equity"]),
         total_return=_float_value(data["total_return"]),
+        annualized_return=_float_value(data.get("annualized_return", 0.0)),
+        annualized_volatility=_float_value(data.get("annualized_volatility", 0.0)),
         sharpe=_float_value(data["sharpe"]),
+        sortino=_float_value(data.get("sortino", 0.0)),
+        calmar=_float_value(data.get("calmar", 0.0)),
         max_drawdown=_float_value(data["max_drawdown"]),
         total_commission=_float_value(data["total_commission"]),
         total_slippage_cost=_float_value(data["total_slippage_cost"]),
@@ -155,6 +168,45 @@ def run_backtest(
     artifact_store: ArtifactStore | None = None,
     persistence: Database | None = None,
 ) -> dict[str, object]:
+    """Run a simulation and close any persistence resource owned by this call."""
+    owned_database = Database(cfg.database_url) if persist and persistence is None else None
+    try:
+        return _run_backtest_impl(
+            cfg,
+            persist,
+            data_source=data_source,
+            strategy=strategy,
+            execution=execution,
+            portfolio=portfolio,
+            warmup_events=warmup_events,
+            run_id=run_id,
+            write_artifact=write_artifact,
+            cancel_requested=cancel_requested,
+            tenant_id=tenant_id,
+            artifact_store=artifact_store,
+            persistence=owned_database or persistence,
+        )
+    finally:
+        if owned_database is not None:
+            owned_database.close()
+
+
+def _run_backtest_impl(
+    cfg: BacktestConfig,
+    persist: bool = True,
+    *,
+    data_source: MarketDataSource | None = None,
+    strategy: Strategy | None = None,
+    execution: SimulatedExecutionHandler | None = None,
+    portfolio: MultiAssetPortfolio | None = None,
+    warmup_events: Iterable[MarketEvent] = (),
+    run_id: str | None = None,
+    write_artifact: bool | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
+    tenant_id: str = "default",
+    artifact_store: ArtifactStore | None = None,
+    persistence: Database | None = None,
+) -> dict[str, object]:
     """Run one deterministic simulation.
 
     Infrastructure is injected through ports so the simulation can be exercised
@@ -165,11 +217,7 @@ def run_backtest(
     started_at = dt.datetime.now(dt.UTC)
     resolved_run_id = run_id or new_run_id()
     should_write_artifact = persist if write_artifact is None else write_artifact
-    output_directory = (
-        cfg.ensure_outdir()
-        if should_write_artifact and artifact_store is None
-        else Path(cfg.out_dir)
-    )
+    output_directory = Path(cfg.out_dir)
     logger.info(
         "Backtest started",
         extra={
@@ -181,6 +229,7 @@ def run_backtest(
             }
         },
     )
+    _raise_if_cancelled(resolved_run_id, cancel_requested)
 
     database: Database | None = None
     if persist:
@@ -203,21 +252,34 @@ def run_backtest(
         risk_cfg=cfg.risk,
     )
 
+    warmup_digest = hashlib.sha256()
+    warmup_event_count = 0
+    warmup_handler = getattr(selected_strategy, "warmup", None)
     for warmup_event in warmup_events:
         if warmup_event.symbol in cfg.symbols:
-            selected_strategy.on_market(warmup_event)
+            if not callable(warmup_handler):
+                raise TypeError("Strategies used with warmup data must implement warmup(event)")
+            _event_digest_update(warmup_digest, warmup_event)
+            warmup_event_count += 1
+            warmup_handler(warmup_event)
+    _raise_if_cancelled(resolved_run_id, cancel_requested)
 
     active_liquidations: dict[str, str] = {}
     dataset_digest = hashlib.sha256()
+    seen_symbols: set[str] = set()
+    last_markets: dict[str, MarketEvent] = {}
+    final_timestamp: dt.datetime | None = None
 
     grouped_events = groupby(source.stream(), key=lambda market: market.timestamp)
     for timestamp, timestamp_events_iter in grouped_events:
-        if cancel_requested is not None and cancel_requested():
-            raise BacktestCancelled(f"Backtest {resolved_run_id} was canceled")
+        _raise_if_cancelled(resolved_run_id, cancel_requested)
+        final_timestamp = timestamp
         timestamp_events = tuple(timestamp_events_iter)
         for market in timestamp_events:
             _event_digest_update(dataset_digest, market)
             if market.symbol in cfg.symbols:
+                seen_symbols.add(market.symbol)
+                last_markets[market.symbol] = market
                 selected_portfolio.update_market_price(market.symbol, market.mid)
 
         flattened_by_liquidation: set[str] = set()
@@ -300,9 +362,67 @@ def run_backtest(
                         quantity=cfg.trade_quantity,
                         order_type=OrderType.MARKET,
                         intent=OrderIntent.STRATEGY,
+                        client_order_id=(
+                            f"{resolved_run_id}:strategy:{signal.symbol}:"
+                            f"{signal.timestamp.isoformat()}"
+                        ),
                     )
                 )
 
+    _raise_if_cancelled(resolved_run_id, cancel_requested)
+    missing_symbols = sorted(set(cfg.symbols) - seen_symbols)
+    if missing_symbols and cfg.data.require_all_symbols:
+        raise ValueError(f"Dataset has no events for configured symbols: {missing_symbols}")
+
+    canceled_at_end: list[str] = []
+    if cfg.end_of_run.pending_order_policy == "cancel":
+        canceled_at_end = selected_execution.cancel_all()
+        active_liquidations.clear()
+
+    open_before_end = {
+        symbol: selected_portfolio.get_position(symbol).quantity
+        for symbol in cfg.symbols
+        if selected_portfolio.get_position(symbol).quantity != 0
+    }
+    end_liquidation_count = 0
+    if cfg.end_of_run.position_policy == "require_flat" and open_before_end:
+        raise ValueError(
+            "End-of-run policy requires a flat portfolio; open positions remain for "
+            f"{sorted(open_before_end)}"
+        )
+    if cfg.end_of_run.position_policy == "liquidate" and open_before_end:
+        if final_timestamp is None:
+            raise ValueError("Cannot liquidate positions without a final market timestamp")
+        for symbol, position_quantity in sorted(open_before_end.items()):
+            _raise_if_cancelled(resolved_run_id, cancel_requested)
+            last_market = last_markets.get(symbol)
+            if last_market is None:
+                raise ValueError(f"Cannot liquidate {symbol}: no final market quote")
+            closing_market = MarketEvent(
+                timestamp=final_timestamp,
+                symbol=symbol,
+                mid=last_market.mid,
+                bid=last_market.bid,
+                ask=last_market.ask,
+                spread_bps=last_market.spread_bps,
+                volume=last_market.volume,
+            )
+            liquidation_fill = selected_execution.force_liquidation(
+                closing_market,
+                position_quantity=position_quantity,
+                client_order_id=f"{resolved_run_id}:end-liquidation:{symbol}",
+            )
+            if liquidation_fill is not None:
+                selected_portfolio.on_fill(liquidation_fill)
+                end_liquidation_count += 1
+        selected_portfolio.snapshot_equity(final_timestamp)
+        active_liquidations.clear()
+
+    open_positions = {
+        symbol: selected_portfolio.get_position(symbol).quantity
+        for symbol in cfg.symbols
+        if selected_portfolio.get_position(symbol).quantity != 0
+    }
     final_equity = selected_portfolio.equity()
     if selected_portfolio.equity_curve and selected_portfolio.equity_curve[-1] != final_equity:
         raise RuntimeError("Final equity snapshot is out of sync with portfolio state")
@@ -318,14 +438,45 @@ def run_backtest(
         cfg,
         run_id=resolved_run_id,
         dataset_hash=dataset_digest.hexdigest(),
-        strategy=type(selected_strategy).__qualname__,
+        warmup_hash=warmup_digest.hexdigest(),
+        warmup_event_count=warmup_event_count,
+        strategy=selected_strategy,
     )
+    deterministic_context: dict[str, object] = {
+        "schema_version": 2,
+        "engine_version": manifest.engine_version,
+        "engine_semantics_version": manifest.engine_semantics_version,
+        "config_hash": manifest.config_hash,
+        "dataset_hash": manifest.dataset_hash,
+        "raw_dataset_hash": manifest.raw_dataset_hash,
+        "warmup_hash": manifest.warmup_hash,
+        "warmup_event_count": manifest.warmup_event_count,
+        "strategy": manifest.strategy,
+        "strategy_hash": manifest.strategy_hash,
+        "rng_seed": manifest.rng_seed,
+        "rng_stream_version": manifest.rng_stream_version,
+        "pending_order_count": selected_execution.pending_order_count(),
+        "open_positions": open_positions,
+        "end_canceled_order_count": len(canceled_at_end),
+        "end_liquidation_count": end_liquidation_count,
+        "active_liquidation_symbols": sorted(active_liquidations),
+        "equity_observation_count": performance.observation_count,
+        "periods_per_year": performance.periods_per_year,
+        "journal_entry_count": len(selected_portfolio.journal),
+    }
     extra_payload: dict[str, object] = {
         "execution": asdict(cfg.execution),
         "risk": asdict(cfg.risk),
         "metrics": asdict(cfg.metrics),
         "data": asdict(cfg.data),
         "pending_order_count": selected_execution.pending_order_count(),
+        "open_positions": open_positions,
+        "gross_exposure": selected_portfolio.gross_exposure(),
+        "net_exposure": selected_portfolio.net_exposure(),
+        "missing_symbols": missing_symbols,
+        "end_of_run": asdict(cfg.end_of_run),
+        "end_canceled_order_count": len(canceled_at_end),
+        "end_liquidation_count": end_liquidation_count,
         "active_liquidation_symbols": sorted(active_liquidations),
         # Kept for compatibility with the safety regression suite.
         "active_stop_symbols": sorted(active_liquidations),
@@ -335,6 +486,7 @@ def run_backtest(
         "max_persisted_equity_points": cfg.max_persisted_equity_points,
         "effective_config": cfg.to_dict(redact_secrets=True),
         "manifest": manifest.to_dict(),
+        "deterministic_context": deterministic_context,
     }
     completed_at = dt.datetime.now(dt.UTC)
     typed_result = BacktestResult(
@@ -346,7 +498,11 @@ def run_backtest(
         initial_cash=cfg.initial_cash,
         final_equity=final_equity,
         total_return=performance.total_return,
+        annualized_return=performance.annualized_return,
+        annualized_volatility=performance.annualized_volatility,
         sharpe=performance.sharpe,
+        sortino=performance.sortino,
+        calmar=performance.calmar,
         max_drawdown=performance.max_drawdown,
         total_commission=selected_portfolio.total_commission,
         total_slippage_cost=selected_portfolio.total_slippage_cost,
@@ -359,15 +515,13 @@ def run_backtest(
     )
     result = typed_result.to_dict()
 
-    artifact_descriptor = None
-    if should_write_artifact:
-        selected_artifact_store = artifact_store or LocalArtifactStore(output_directory)
-        artifact_descriptor = selected_artifact_store.write_result(
-            typed_result,
-            manifest=manifest,
-        )
+    artifact_payload = serialize_result(typed_result, manifest) if should_write_artifact else None
+    selected_artifact_store = (
+        artifact_store or LocalArtifactStore(output_directory) if should_write_artifact else None
+    )
 
     if persist:
+        _raise_if_cancelled(resolved_run_id, cancel_requested)
         assert database is not None
         model = run_to_model(result, tenant_id=tenant_id)
         _attach_run_details(
@@ -376,16 +530,33 @@ def run_backtest(
             selected_portfolio,
             max_equity_points=cfg.max_persisted_equity_points,
         )
-        if artifact_descriptor is not None:
-            model.artifacts.append(
-                RunArtifact(
-                    kind="result",
-                    uri=artifact_descriptor.uri,
-                    content_hash=artifact_descriptor.content_hash,
-                    size_bytes=artifact_descriptor.size_bytes,
-                )
+        if artifact_payload is not None:
+            database.stage_run_with_artifact(
+                model,
+                kind="result",
+                payload=artifact_payload,
             )
-        database.insert_run(model)
+            assert selected_artifact_store is not None
+            publish_pending_artifacts(
+                database,
+                selected_artifact_store,
+                run_id=resolved_run_id,
+                tenant_id=tenant_id,
+                ensure_active=lambda: _raise_if_cancelled(
+                    resolved_run_id,
+                    cancel_requested,
+                ),
+            )
+        else:
+            database.insert_run(model)
+    elif artifact_payload is not None:
+        _raise_if_cancelled(resolved_run_id, cancel_requested)
+        assert selected_artifact_store is not None
+        selected_artifact_store.write_payload(
+            run_id=resolved_run_id,
+            kind="result",
+            payload=artifact_payload,
+        )
 
     logger.info(
         "Backtest completed",

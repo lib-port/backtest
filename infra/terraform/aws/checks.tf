@@ -2,21 +2,29 @@ check "authentication_configuration" {
   assert {
     condition = (
       var.auth_mode == "api-key"
-      ? var.api_keys_secret_arn != null && var.api_keys_secret_arn != ""
+      ? (
+        var.api_keys_secret_arn != null && var.api_keys_secret_arn != ""
+        && var.api_key_pepper_secret_arn != null
+        && var.api_key_pepper_secret_arn != ""
+      )
       : alltrue([
         startswith(var.oidc_issuer, "https://"),
         var.oidc_audience != "",
         startswith(var.oidc_jwks_url, "https://"),
       ])
     )
-    error_message = "Configure either an API-key secret ARN or complete HTTPS OIDC settings."
+    error_message = "Configure API-key and pepper secret ARNs or complete HTTPS OIDC settings."
   }
 }
 
 check "separate_database_credentials" {
   assert {
-    condition     = var.application_db_secret_arn != aws_db_instance.database.master_user_secret[0].secret_arn
-    error_message = "Runtime services must not use the RDS master-user secret."
+    condition = alltrue([
+      var.api_db_secret_arn != aws_db_instance.database.master_user_secret[0].secret_arn,
+      var.worker_db_secret_arn != aws_db_instance.database.master_user_secret[0].secret_arn,
+      var.api_db_secret_arn != var.worker_db_secret_arn,
+    ])
+    error_message = "API, worker, and RDS owner credentials must all be separate secrets."
   }
 }
 
