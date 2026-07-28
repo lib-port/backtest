@@ -32,12 +32,12 @@ service = [
 dev = [
   "build>=1.2,<2",
   "pytest>=8.0,<10",
-  "pytest-cov>=5,<8",
+  "pytest-cov>=7,<8",
   "ruff>=0.6,<1",
   "mypy>=1.10,<2",
   "types-python-dateutil",
   "hypothesis>=6.0,<7",
-  "httpx2>=2,<3",
+  "httpx>=0.28,<1",
   "pip-audit>=2.9,<3",
   "pre-commit>=4,<5",
 ]
@@ -56,10 +56,22 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q --strict-markers"
+addopts = "-q --strict-config --strict-markers"
+xfail_strict = true
+filterwarnings = ["error"]
 markers = [
   "integration: tests that require external infrastructure",
 ]
+
+[tool.coverage.run]
+branch = true
+patch = ["subprocess"]
+source = ["quant_backtester"]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true
+skip_covered = true
 
 [tool.ruff]
 line-length = 100
@@ -79,5 +91,6 @@ warn_unused_configs = true
 show_error_codes = true
 
 [[tool.mypy.overrides]]
-module = ["boto3", "boto3.*", "pandas", "yaml", "uvicorn"]
+module = ["boto3", "boto3.*", "botocore", "botocore.*", "pandas", "yaml", "uvicorn"]
 ignore_missing_imports = true
+disable_error_code = ["import-untyped"]

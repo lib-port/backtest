@@ -129,9 +129,9 @@ resource "aws_security_group" "alb" {
   lifecycle { create_before_destroy = true }
 }
 
-resource "aws_security_group" "app" {
-  name_prefix = "${local.name}-app-"
-  description = "ECS API and worker tasks"
+resource "aws_security_group" "api" {
+  name_prefix = "${local.name}-api-"
+  description = "ECS API tasks"
   vpc_id      = aws_vpc.this.id
 
   ingress {
@@ -144,6 +144,46 @@ resource "aws_security_group" "app" {
 
   egress {
     description = "TLS to AWS APIs and OIDC"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    description = "DNS over UDP"
+    from_port   = 53
+    to_port     = 53
+    protocol    = "udp"
+    cidr_blocks = [var.vpc_cidr]
+  }
+
+  egress {
+    description = "DNS over TCP"
+    from_port   = 53
+    to_port     = 53
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+  }
+
+  egress {
+    description     = "PostgreSQL"
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.database.id]
+  }
+
+  lifecycle { create_before_destroy = true }
+}
+
+resource "aws_security_group" "worker" {
+  name_prefix = "${local.name}-worker-"
+  description = "ECS worker and migration tasks with no inbound listener"
+  vpc_id      = aws_vpc.this.id
+
+  egress {
+    description = "TLS to AWS APIs"
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
@@ -192,10 +232,19 @@ resource "aws_security_group" "database" {
   lifecycle { create_before_destroy = true }
 }
 
-resource "aws_vpc_security_group_ingress_rule" "database_from_app" {
+resource "aws_vpc_security_group_ingress_rule" "database_from_api" {
   security_group_id            = aws_security_group.database.id
-  referenced_security_group_id = aws_security_group.app.id
-  description                  = "PostgreSQL from application tasks"
+  referenced_security_group_id = aws_security_group.api.id
+  description                  = "PostgreSQL from API tasks"
+  from_port                    = 5432
+  to_port                      = 5432
+  ip_protocol                  = "tcp"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "database_from_worker" {
+  security_group_id            = aws_security_group.database.id
+  referenced_security_group_id = aws_security_group.worker.id
+  description                  = "PostgreSQL from worker and migration tasks"
   from_port                    = 5432
   to_port                      = 5432
   ip_protocol                  = "tcp"

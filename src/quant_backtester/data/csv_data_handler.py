@@ -61,15 +61,20 @@ class CSVDataHandler:
         return digest.hexdigest()
 
     @staticmethod
-    def _to_optional_float(value: object) -> float | None:
+    def _to_optional_float(
+        value: object,
+        *,
+        name: str,
+        row_num: int,
+    ) -> float | None:
         if value is None or pd.isna(value):
             return None
         if isinstance(value, (Real, str)):
             try:
                 return float(value)
-            except ValueError:
-                return None
-        return None
+            except ValueError as exc:
+                raise ValueError(f"Invalid {name} at row {row_num}: {value!r}") from exc
+        raise ValueError(f"Invalid {name} at row {row_num}: {value!r}")
 
     @staticmethod
     def _to_required_float(value: object, *, name: str, row_num: int) -> float:
@@ -113,10 +118,14 @@ class CSVDataHandler:
         if mid <= 0:
             raise ValueError(f"Invalid mid at row {row_num}: must be > 0, got {mid}")
 
-        bid = self._to_optional_float(row.get("bid"))
-        ask = self._to_optional_float(row.get("ask"))
-        spread_bps = self._to_optional_float(row.get("spread_bps"))
-        volume = self._to_optional_float(row.get("volume"))
+        bid = self._to_optional_float(row.get("bid"), name="bid", row_num=row_num)
+        ask = self._to_optional_float(row.get("ask"), name="ask", row_num=row_num)
+        spread_bps = self._to_optional_float(
+            row.get("spread_bps"),
+            name="spread_bps",
+            row_num=row_num,
+        )
+        volume = self._to_optional_float(row.get("volume"), name="volume", row_num=row_num)
 
         if bid is not None and (not math.isfinite(bid) or bid <= 0):
             raise ValueError(f"Invalid bid at row {row_num}: must be finite and > 0, got {bid}")
@@ -124,6 +133,11 @@ class CSVDataHandler:
             raise ValueError(f"Invalid ask at row {row_num}: must be finite and > 0, got {ask}")
         if bid is not None and ask is not None and ask < bid:
             raise ValueError(f"Invalid quote at row {row_num}: ask ({ask}) must be >= bid ({bid})")
+        if bid is not None and ask is not None and not bid <= mid <= ask:
+            raise ValueError(
+                f"Invalid quote at row {row_num}: mid ({mid}) must be between "
+                f"bid ({bid}) and ask ({ask})"
+            )
         if spread_bps is not None and (not math.isfinite(spread_bps) or spread_bps < 0):
             raise ValueError(
                 f"Invalid spread_bps at row {row_num}: must be finite and >= 0, got {spread_bps}"
@@ -144,16 +158,46 @@ class CSVDataHandler:
         )
 
     def _chunks(self) -> Iterator[pd.DataFrame]:
-        if self.config.require_sorted:
-            yield from pd.read_csv(self.csv_path, chunksize=self.config.chunksize)
-            return
-        frame = pd.read_csv(self.csv_path)
-        if "date" not in frame.columns:
-            yield frame
-            return
-        parsed = pd.to_datetime(frame["date"], errors="coerce", utc=True)
-        frame = frame.assign(_parsed_date=parsed).sort_values("_parsed_date", kind="stable")
-        yield frame.drop(columns=["_parsed_date"])
+        read_options: dict[str, object] = {
+            "chunksize": self.config.chunksize,
+            "encoding": "utf-8",
+            "on_bad_lines": "error",
+        }
+        try:
+            chunks = pd.read_csv(self.csv_path, **read_options)
+            try:
+                if self.config.require_sorted:
+                    yield from chunks
+                    return
+
+                buffered: list[pd.DataFrame] = []
+                buffered_rows = 0
+                for chunk in chunks:
+                    buffered_rows += len(chunk)
+                    if buffered_rows > self.config.max_events:
+                        raise ValueError(
+                            f"CSV exceeds configured max_events={self.config.max_events}"
+                        )
+                    buffered.append(chunk)
+                if not buffered:
+                    return
+                frame = pd.concat(buffered, ignore_index=True)
+                if "date" not in frame.columns:
+                    yield frame
+                    return
+                sort_keys = [
+                    self._timestamp(value, row_num=index + 1)
+                    for index, value in enumerate(frame["date"])
+                ]
+                frame = frame.assign(_parsed_date=sort_keys).sort_values(
+                    "_parsed_date",
+                    kind="stable",
+                )
+                yield frame.drop(columns=["_parsed_date"])
+            finally:
+                chunks.close()
+        except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeError) as exc:
+            raise ValueError(f"Invalid CSV dataset: {exc}") from exc
 
     def stream(self) -> Iterator[MarketEvent]:
         previous_timestamp: datetime | None = None
@@ -168,6 +212,11 @@ class CSVDataHandler:
                 missing = required - set(frame.columns)
                 if missing:
                     raise ValueError(f"CSV missing columns: {sorted(missing)}")
+                if self.config.strict_schema:
+                    allowed = required | {"bid", "ask", "spread_bps", "volume"}
+                    unexpected = set(frame.columns) - allowed
+                    if unexpected:
+                        raise ValueError(f"CSV has unexpected columns: {sorted(unexpected)}")
                 columns_checked = True
 
             for raw_row in frame.to_dict(orient="records"):
@@ -201,8 +250,6 @@ class CSVDataHandler:
                 timestamp_bucket[event.symbol] = event
                 previous_timestamp = event.timestamp
 
-        if not columns_checked:
-            # pandas raises EmptyDataError for a zero-byte file before this point,
-            # but a header-only file is a valid empty dataset.
-            return
+        if not columns_checked or row_num == 0:
+            raise ValueError("CSV dataset must contain at least one data row")
         yield from timestamp_bucket.values()

@@ -23,7 +23,8 @@ RUN python -m pip wheel \
 RUN python -m venv /opt/venv \
     && /opt/venv/bin/python -m pip install \
       --requirement /build/requirements/service.lock \
-    && /opt/venv/bin/python -m pip install --no-deps /tmp/wheels/*.whl
+    && /opt/venv/bin/python -m pip install --no-deps /tmp/wheels/*.whl \
+    && /opt/venv/bin/python -m pip check
 
 FROM ${PYTHON_IMAGE} AS runtime
 

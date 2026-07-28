@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import hashlib
 import math
-import random
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -26,6 +26,9 @@ class _PendingOrder:
     remaining: int
     commission_charged: bool = False
     stop_triggered: bool = False
+    random_sequence: int = 0
+    fill_sequence: int = 0
+    rng_identity: str = ""
 
 
 @dataclass(frozen=True)
@@ -60,9 +63,8 @@ class SimulatedExecutionHandler:
     - **Order lifecycle**: stable IDs, cancellation, remaining quantity, and reduce-only fills.
     - Slippage model still applies: executable quote + linear impact (relative to mid).
 
-    Notes:
-    - This remains a **simulation**; it's deterministic if you set PYTHONHASHSEED and RNG seed externally.
-    - For serious research, replace with historical L2 replay / queue model.
+    Random queue decisions use a keyed, versioned stream so activity in one
+    symbol does not perturb another symbol's fill path.
     """
 
     commission_per_trade: float
@@ -71,15 +73,14 @@ class SimulatedExecutionHandler:
 
     _tick_index: dict[str, int] = field(default_factory=dict, init=False)
     _pending: dict[str, deque[_PendingOrder]] = field(default_factory=dict, init=False)
-    _rng: random.Random = field(init=False)
-    _next_order_sequence: int = field(default=1, init=False)
-    _next_execution_sequence: int = field(default=1, init=False)
+    _symbol_order_sequences: dict[str, int] = field(default_factory=dict, init=False)
     _records: dict[str, _OrderRecord] = field(default_factory=dict, init=False)
     _client_order_ids: dict[str, str] = field(default_factory=dict, init=False)
     _fill_history: list[FillEvent] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
-        self._rng = random.Random(self.rng_seed)
+        # Retained as an extension hook for custom execution adapters.
+        pass
 
     def submit(self, order: OrderEvent) -> str:
         if order.client_order_id is not None:
@@ -96,8 +97,10 @@ class SimulatedExecutionHandler:
         if sym not in self._pending:
             self._pending[sym] = deque()
         tick = self._tick_index.get(sym, 0)
-        order_id = f"sim-{self._next_order_sequence}"
-        self._next_order_sequence += 1
+        symbol_sequence = self._symbol_order_sequences.get(sym, 0) + 1
+        self._symbol_order_sequences[sym] = symbol_sequence
+        symbol_key = hashlib.sha256(sym.encode("utf-8")).hexdigest()[:12]
+        order_id = f"sim-{symbol_key}-{symbol_sequence}"
         self._records[order_id] = _OrderRecord(
             order=order,
             status=OrderStatus.ACCEPTED,
@@ -112,6 +115,7 @@ class SimulatedExecutionHandler:
                 order=order,
                 submitted_tick=tick,
                 remaining=order.quantity,
+                rng_identity=order.client_order_id or f"{sym}:{symbol_sequence}",
             )
         )
         return order_id
@@ -151,6 +155,12 @@ class SimulatedExecutionHandler:
             self._pending[symbol] = retained
         else:
             self._pending.pop(symbol, None)
+        return cancelled
+
+    def cancel_all(self) -> list[str]:
+        cancelled: list[str] = []
+        for symbol in tuple(self._pending):
+            cancelled.extend(self.cancel_symbol_orders(symbol))
         return cancelled
 
     def is_pending(self, order_id: str) -> bool:
@@ -291,7 +301,8 @@ class SimulatedExecutionHandler:
                 p_fill = self.cfg.micro.base_fill_probability * (
                     1.0 - self.cfg.micro.queue_ahead_fraction
                 )
-                if self._rng.random() > p_fill:
+                pending.random_sequence += 1
+                if self._keyed_random(pending, market, tick) > p_fill:
                     if pending.order.time_in_force == TimeInForce.IOC:
                         q.popleft()
                         record.status = OrderStatus.CANCELED
@@ -336,12 +347,14 @@ class SimulatedExecutionHandler:
                 break
 
             commission = 0.0 if pending.commission_charged else self.commission_per_trade
+            pending.fill_sequence += 1
             fill = self._fill(
                 pending.order_id,
                 pending.order,
                 market,
                 fill_qty,
                 commission=commission,
+                fill_sequence=pending.fill_sequence,
             )
             fills.append(fill)
             self._fill_history.append(fill)
@@ -373,6 +386,66 @@ class SimulatedExecutionHandler:
         if not q:
             self._pending.pop(sym, None)
         return fills
+
+    def force_liquidation(
+        self,
+        market: MarketEvent,
+        *,
+        position_quantity: int,
+        client_order_id: str,
+    ) -> FillEvent | None:
+        """Close a position at the final executable quote, bypassing latency and volume.
+
+        This models an explicit end-of-run liquidation auction. Spread, impact,
+        and commission still apply and the resulting order/fill are persisted.
+        """
+        if position_quantity == 0:
+            return None
+        self.cancel_symbol_orders(market.symbol)
+        order = OrderEvent(
+            timestamp=market.timestamp,
+            symbol=market.symbol,
+            side=Side.SELL if position_quantity > 0 else Side.BUY,
+            quantity=abs(position_quantity),
+            order_type=OrderType.MARKET,
+            intent=OrderIntent.RISK_LIQUIDATION,
+            reduce_only=True,
+            client_order_id=client_order_id,
+        )
+        order_id = self.submit(order)
+        pending_orders = self._pending[market.symbol]
+        pending = next(item for item in pending_orders if item.order_id == order_id)
+        pending_orders.remove(pending)
+        if not pending_orders:
+            self._pending.pop(market.symbol, None)
+        fill = self._fill(
+            order_id,
+            order,
+            market,
+            order.quantity,
+            commission=self.commission_per_trade,
+            fill_sequence=1,
+        )
+        record = self._records[order_id]
+        record.status = OrderStatus.FILLED
+        record.filled_quantity = order.quantity
+        record.remaining_quantity = 0
+        self._fill_history.append(fill)
+        return fill
+
+    def _keyed_random(
+        self,
+        pending: _PendingOrder,
+        market: MarketEvent,
+        tick: int,
+    ) -> float:
+        key = (
+            f"qbt-rng-v2|{self.rng_seed}|{pending.rng_identity}|"
+            f"{market.timestamp.isoformat()}|{tick}|{pending.random_sequence}|"
+            f"{pending.remaining}"
+        )
+        raw = int.from_bytes(hashlib.sha256(key.encode("utf-8")).digest()[:8], "big")
+        return raw / 2**64
 
     def _stop_is_triggered(self, order: OrderEvent, market: MarketEvent) -> bool:
         assert order.stop_price is not None
@@ -446,6 +519,7 @@ class SimulatedExecutionHandler:
         market: MarketEvent,
         qty: int,
         commission: float,
+        fill_sequence: int,
     ) -> FillEvent:
         impact_bps = self.cfg.impact_bps_per_unit * (qty / max(self.cfg.impact_volume, 1.0))
         impact = market.mid * (impact_bps / 10_000.0)
@@ -464,8 +538,7 @@ class SimulatedExecutionHandler:
 
         slippage = price - market.mid
 
-        execution_id = f"{order_id}-fill-{self._next_execution_sequence}"
-        self._next_execution_sequence += 1
+        execution_id = f"{order_id}-fill-{fill_sequence}"
         return FillEvent(
             timestamp=market.timestamp,
             symbol=order.symbol,

@@ -113,6 +113,9 @@ class MultiAssetPortfolio:
     _total_slippage_cost: Decimal = field(default=Decimal("0"), init=False, repr=False)
     _applied_execution_ids: set[str] = field(default_factory=set, init=False, repr=False)
     _anonymous_fill_sequence: int = field(default=1, init=False, repr=False)
+    _current_day: dt.date | None = field(default=None, init=False, repr=False)
+    _day_start_equity: Decimal | None = field(default=None, init=False, repr=False)
+    _previous_snapshot_equity: Decimal | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._cash = _money(_decimal(self.initial_cash))
@@ -144,11 +147,28 @@ class MultiAssetPortfolio:
         return self.positions[normalized]
 
     def gross_exposure(self) -> float:
-        gross = sum(
-            abs(position.quantity) * self._marks.get(symbol, Decimal("0"))
-            for symbol, position in self.positions.items()
+        return float(self._gross_exposure())
+
+    def net_exposure(self) -> float:
+        return float(self._net_exposure())
+
+    def _gross_exposure(self) -> Decimal:
+        return sum(
+            (
+                abs(position.quantity) * self._marks.get(symbol, Decimal("0"))
+                for symbol, position in self.positions.items()
+            ),
+            Decimal("0"),
         )
-        return float(gross)
+
+    def _net_exposure(self) -> Decimal:
+        return sum(
+            (
+                position.quantity * self._marks.get(symbol, Decimal("0"))
+                for symbol, position in self.positions.items()
+            ),
+            Decimal("0"),
+        )
 
     def can_place_order(
         self,
@@ -165,17 +185,29 @@ class MultiAssetPortfolio:
         proposed = position.quantity + pending_signed_quantity + (qty * side.sign)
         if abs(proposed) > self.risk_cfg.max_position_per_symbol:
             return False
+        if not self.risk_cfg.allow_short and proposed < 0:
+            return False
 
         mark = self._marks.get(normalized)
         if mark is None:
-            return True
+            return False
+        order_notional = mark * qty
+        if self.risk_cfg.max_order_notional is not None and order_notional > _decimal(
+            self.risk_cfg.max_order_notional
+        ):
+            return False
         current_symbol_exposure = abs(position.quantity + pending_signed_quantity) * mark
         proposed_symbol_exposure = abs(proposed) * mark
-        proposed_gross = (
-            _decimal(self.gross_exposure()) - current_symbol_exposure + proposed_symbol_exposure
-        )
+        proposed_gross = self._gross_exposure() - current_symbol_exposure + proposed_symbol_exposure
         if self.risk_cfg.max_gross_exposure is not None and proposed_gross > _decimal(
             self.risk_cfg.max_gross_exposure
+        ):
+            return False
+        current_symbol_net = (position.quantity + pending_signed_quantity) * mark
+        proposed_symbol_net = proposed * mark
+        proposed_net = self._net_exposure() - current_symbol_net + proposed_symbol_net
+        if self.risk_cfg.max_net_exposure is not None and abs(proposed_net) > _decimal(
+            self.risk_cfg.max_net_exposure
         ):
             return False
         equity = max(self._equity, Decimal("0"))
@@ -305,6 +337,24 @@ class MultiAssetPortfolio:
             if drawdown >= self.risk_cfg.max_drawdown_pct and not self.risk_state.trading_halted:
                 self.risk_state.trading_halted = True
                 self.risk_state.halt_reason = f"Max drawdown reached: {drawdown:.2%}"
+        if timestamp is not None:
+            observation_day = as_utc(timestamp).date()
+            if self._current_day != observation_day:
+                self._current_day = observation_day
+                self._day_start_equity = self._previous_snapshot_equity or _decimal(
+                    self.initial_cash
+                )
+            if (
+                self.risk_cfg.max_daily_loss_pct is not None
+                and self._day_start_equity is not None
+                and self._day_start_equity > 0
+                and not self.risk_state.trading_halted
+            ):
+                daily_loss = (self._day_start_equity - self._equity) / self._day_start_equity
+                if daily_loss >= _decimal(self.risk_cfg.max_daily_loss_pct):
+                    self.risk_state.trading_halted = True
+                    self.risk_state.halt_reason = f"Max daily loss reached: {daily_loss:.2%}"
+            self._previous_snapshot_equity = self._equity
         return equity
 
     def mark_to_market(
@@ -335,6 +385,8 @@ class MultiAssetPortfolio:
             )
 
     def check_stop_loss(self, symbol: str) -> Side | None:
+        if self.risk_cfg.stop_loss_pct <= 0:
+            return None
         position = self.positions.get(symbol)
         if position is None or position.quantity == 0:
             return None

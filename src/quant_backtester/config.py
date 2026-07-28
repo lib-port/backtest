@@ -88,6 +88,8 @@ class DataConfig:
     chunksize: int = 50_000
     require_sorted: bool = True
     max_events: int = 2_000_000
+    strict_schema: bool = True
+    require_all_symbols: bool = True
 
     def __post_init__(self) -> None:
         try:
@@ -96,10 +98,10 @@ class DataConfig:
             raise ValueError(f"Unknown source_timezone: {self.source_timezone}") from exc
         if self.duplicate_policy not in ("error", "last"):
             raise ValueError(f"Unsupported duplicate_policy: {self.duplicate_policy}")
-        if self.chunksize <= 0:
-            raise ValueError(f"chunksize must be > 0, got {self.chunksize}")
-        if self.max_events <= 0:
-            raise ValueError(f"max_events must be > 0, got {self.max_events}")
+        if not 1 <= self.chunksize <= 1_000_000:
+            raise ValueError(f"chunksize must be in [1, 1000000], got {self.chunksize}")
+        if not 1 <= self.max_events <= 50_000_000:
+            raise ValueError(f"max_events must be in [1, 50000000], got {self.max_events}")
 
 
 @dataclass(frozen=True)
@@ -122,7 +124,11 @@ class RiskConfig:
     stop_loss_pct: float = 0.05  # 5% stop from avg cost
     max_drawdown_pct: float = 0.20  # halt if equity drawdown exceeds this
     max_gross_exposure: float | None = None
+    max_net_exposure: float | None = None
+    max_order_notional: float | None = None
     max_leverage: float = 1.0
+    max_daily_loss_pct: float | None = None
+    allow_short: bool = True
 
     def __post_init__(self) -> None:
         if self.max_position_per_symbol <= 0:
@@ -133,7 +139,31 @@ class RiskConfig:
         _require_range("max_drawdown_pct", self.max_drawdown_pct, 0.0, 1.0)
         if self.max_gross_exposure is not None:
             _require_positive("max_gross_exposure", self.max_gross_exposure)
+        if self.max_net_exposure is not None:
+            _require_positive("max_net_exposure", self.max_net_exposure)
+        if self.max_order_notional is not None:
+            _require_positive("max_order_notional", self.max_order_notional)
         _require_positive("max_leverage", self.max_leverage)
+        if self.max_leverage > 100:
+            raise ValueError("max_leverage must be <= 100")
+        if self.max_daily_loss_pct is not None:
+            _require_range("max_daily_loss_pct", self.max_daily_loss_pct, 0.0, 1.0)
+
+
+PendingOrderPolicy = Literal["cancel", "retain"]
+PositionEndPolicy = Literal["mark_to_market", "liquidate", "require_flat"]
+
+
+@dataclass(frozen=True)
+class EndOfRunConfig:
+    pending_order_policy: PendingOrderPolicy = "cancel"
+    position_policy: PositionEndPolicy = "mark_to_market"
+
+    def __post_init__(self) -> None:
+        if self.pending_order_policy not in ("cancel", "retain"):
+            raise ValueError(f"Unsupported pending_order_policy: {self.pending_order_policy}")
+        if self.position_policy not in ("mark_to_market", "liquidate", "require_flat"):
+            raise ValueError(f"Unsupported position_policy: {self.position_policy}")
 
 
 @dataclass(frozen=True)
@@ -147,16 +177,18 @@ class BacktestConfig:
     csv_path: str = "data/sample_prices.csv"
     dataset_id: str | None = None
     dataset_sha256: str | None = None
+    dataset_schema_version: int | None = None
     run_name: str = "default"
     out_dir: str = "runs"
     database_url: str = "sqlite:///runs/runs.db"
-    engine_semantics_version: str = "2.0"
+    engine_semantics_version: str = "3.0"
     max_persisted_equity_points: int = 100_000
 
     execution: ExecutionConfig = ExecutionConfig()
     risk: RiskConfig = RiskConfig()
     data: DataConfig = DataConfig()
     metrics: MetricsConfig = MetricsConfig()
+    end_of_run: EndOfRunConfig = EndOfRunConfig()
 
     def __post_init__(self) -> None:
         if not self.symbols:
@@ -192,6 +224,8 @@ class BacktestConfig:
                 raise ValueError("dataset_id must be a lowercase UUID") from exc
             if self.dataset_id != canonical_dataset_id:
                 raise ValueError("dataset_id must be a canonical lowercase UUID")
+        if self.dataset_schema_version is not None and self.dataset_schema_version != 1:
+            raise ValueError("Only dataset_schema_version=1 is supported")
         if not self.run_name.strip() or len(self.run_name) > 128:
             raise ValueError("run_name must contain 1 to 128 characters")
         if not self.out_dir.strip():
@@ -223,6 +257,38 @@ class BacktestConfig:
         payload.pop("csv_path", None)
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def enforce_compute_limits(
+    config: BacktestConfig,
+    *,
+    max_symbols: int,
+    max_events: int,
+    max_unsorted_events: int,
+    max_equity_points: int,
+    require_strict_schema: bool = False,
+) -> None:
+    """Apply deployment-controlled limits to an otherwise valid run configuration."""
+    if min(max_symbols, max_events, max_unsorted_events, max_equity_points) <= 0:
+        raise ValueError("Compute limits must be positive")
+    if len(config.symbols) > max_symbols:
+        raise ValueError(f"symbols exceeds the configured limit of {max_symbols}")
+    if config.data.max_events > max_events:
+        raise ValueError(f"data.max_events exceeds the configured limit of {max_events}")
+    if not config.data.require_sorted and config.data.max_events > max_unsorted_events:
+        raise ValueError(
+            f"Unsorted data exceeds the configured in-memory event limit of {max_unsorted_events}"
+        )
+    if config.max_persisted_equity_points > max_equity_points:
+        raise ValueError(
+            f"max_persisted_equity_points exceeds the configured limit of {max_equity_points}"
+        )
+    if config.long_window > config.data.max_events:
+        raise ValueError("long_window must not exceed data.max_events")
+    if config.trade_quantity > config.risk.max_position_per_symbol:
+        raise ValueError("trade_quantity must not exceed risk.max_position_per_symbol")
+    if require_strict_schema and not config.data.strict_schema:
+        raise ValueError("Strict dataset schemas are required by this deployment")
 
 
 def redact_database_url(url: str) -> str:
@@ -302,6 +368,7 @@ def backtest_config_from_mapping(
     risk_mapping = _nested_mapping(value, "risk")
     data_mapping = _nested_mapping(value, "data")
     metrics_mapping = _nested_mapping(value, "metrics")
+    end_of_run_mapping = _nested_mapping(value, "end_of_run")
     _reject_unknown(
         execution_mapping,
         {
@@ -331,7 +398,11 @@ def backtest_config_from_mapping(
             "stop_loss_pct",
             "max_drawdown_pct",
             "max_gross_exposure",
+            "max_net_exposure",
+            "max_order_notional",
             "max_leverage",
+            "max_daily_loss_pct",
+            "allow_short",
         },
         "risk",
     )
@@ -343,6 +414,8 @@ def backtest_config_from_mapping(
             "chunksize",
             "require_sorted",
             "max_events",
+            "strict_schema",
+            "require_all_symbols",
         },
         "data",
     )
@@ -350,6 +423,11 @@ def backtest_config_from_mapping(
         metrics_mapping,
         {"annual_risk_free_rate", "periods_per_year"},
         "metrics",
+    )
+    _reject_unknown(
+        end_of_run_mapping,
+        {"pending_order_policy", "position_policy"},
+        "end_of_run",
     )
 
     micro = MicrostructureConfig(
@@ -371,6 +449,9 @@ def backtest_config_from_mapping(
         micro=micro,
     )
     raw_max_gross = risk_mapping.get("max_gross_exposure")
+    raw_max_net = risk_mapping.get("max_net_exposure")
+    raw_max_order = risk_mapping.get("max_order_notional")
+    raw_daily_loss = risk_mapping.get("max_daily_loss_pct")
     risk = RiskConfig(
         max_position_per_symbol=_mapping_int(
             risk_mapping,
@@ -382,7 +463,17 @@ def backtest_config_from_mapping(
         max_gross_exposure=(
             None if raw_max_gross is None else _object_float(raw_max_gross, "max_gross_exposure")
         ),
+        max_net_exposure=(
+            None if raw_max_net is None else _object_float(raw_max_net, "max_net_exposure")
+        ),
+        max_order_notional=(
+            None if raw_max_order is None else _object_float(raw_max_order, "max_order_notional")
+        ),
         max_leverage=_mapping_float(risk_mapping, "max_leverage", 1.0),
+        max_daily_loss_pct=(
+            None if raw_daily_loss is None else _object_float(raw_daily_loss, "max_daily_loss_pct")
+        ),
+        allow_short=_mapping_bool(risk_mapping, "allow_short", True),
     )
     data = DataConfig(
         source_timezone=str(data_mapping.get("source_timezone", "UTC")),
@@ -393,6 +484,8 @@ def backtest_config_from_mapping(
         chunksize=_mapping_int(data_mapping, "chunksize", 50_000),
         require_sorted=_mapping_bool(data_mapping, "require_sorted", True),
         max_events=_mapping_int(data_mapping, "max_events", 2_000_000),
+        strict_schema=_mapping_bool(data_mapping, "strict_schema", True),
+        require_all_symbols=_mapping_bool(data_mapping, "require_all_symbols", True),
     )
     raw_periods = metrics_mapping.get("periods_per_year")
     metrics = MetricsConfig(
@@ -403,6 +496,16 @@ def backtest_config_from_mapping(
         ),
         periods_per_year=(
             None if raw_periods is None else _object_float(raw_periods, "periods_per_year")
+        ),
+    )
+    end_of_run = EndOfRunConfig(
+        pending_order_policy=cast(
+            PendingOrderPolicy,
+            str(end_of_run_mapping.get("pending_order_policy", "cancel")),
+        ),
+        position_policy=cast(
+            PositionEndPolicy,
+            str(end_of_run_mapping.get("position_policy", "mark_to_market")),
         ),
     )
     return BacktestConfig(
@@ -417,10 +520,15 @@ def backtest_config_from_mapping(
         dataset_sha256=(
             None if value.get("dataset_sha256") is None else str(value["dataset_sha256"])
         ),
+        dataset_schema_version=(
+            None
+            if value.get("dataset_schema_version") is None
+            else _mapping_int(value, "dataset_schema_version", 1)
+        ),
         run_name=str(value.get("run_name", "run")),
         out_dir=out_dir or str(value.get("out_dir", "runs")),
         database_url=database_url or str(value.get("database_url", "sqlite:///runs/runs.db")),
-        engine_semantics_version=str(value.get("engine_semantics_version", "2.0")),
+        engine_semantics_version=str(value.get("engine_semantics_version", "3.0")),
         max_persisted_equity_points=_mapping_int(
             value,
             "max_persisted_equity_points",
@@ -430,6 +538,7 @@ def backtest_config_from_mapping(
         risk=risk,
         data=data,
         metrics=metrics,
+        end_of_run=end_of_run,
     )
 
 

@@ -16,6 +16,12 @@ resource "aws_cloudwatch_log_group" "migration" {
   kms_key_id        = aws_kms_key.data.arn
 }
 
+resource "aws_cloudwatch_log_group" "waf" {
+  name              = "aws-waf-logs-${local.name}"
+  retention_in_days = var.log_retention_days
+  kms_key_id        = aws_kms_key.data.arn
+}
+
 resource "aws_ecs_cluster" "this" {
   name = local.name
 
@@ -42,24 +48,42 @@ locals {
       valueFrom = "${aws_db_instance.database.master_user_secret[0].secret_arn}:password::"
     },
   ]
-  database_application_secrets = [
+  database_api_secrets = [
     {
       name      = "QBT_DB_USERNAME"
-      valueFrom = "${var.application_db_secret_arn}:username::"
+      valueFrom = "${var.api_db_secret_arn}:username::"
     },
     {
       name      = "QBT_DB_PASSWORD"
-      valueFrom = "${var.application_db_secret_arn}:password::"
+      valueFrom = "${var.api_db_secret_arn}:password::"
+    },
+  ]
+  database_worker_secrets = [
+    {
+      name      = "QBT_DB_USERNAME"
+      valueFrom = "${var.worker_db_secret_arn}:username::"
+    },
+    {
+      name      = "QBT_DB_PASSWORD"
+      valueFrom = "${var.worker_db_secret_arn}:password::"
     },
   ]
   database_bootstrap_secrets = [
     {
-      name      = "QBT_APP_DB_USERNAME"
-      valueFrom = "${var.application_db_secret_arn}:username::"
+      name      = "QBT_API_DB_USERNAME"
+      valueFrom = "${var.api_db_secret_arn}:username::"
     },
     {
-      name      = "QBT_APP_DB_PASSWORD"
-      valueFrom = "${var.application_db_secret_arn}:password::"
+      name      = "QBT_API_DB_PASSWORD"
+      valueFrom = "${var.api_db_secret_arn}:password::"
+    },
+    {
+      name      = "QBT_WORKER_DB_USERNAME"
+      valueFrom = "${var.worker_db_secret_arn}:username::"
+    },
+    {
+      name      = "QBT_WORKER_DB_PASSWORD"
+      valueFrom = "${var.worker_db_secret_arn}:password::"
     },
   ]
   common_environment = concat(
@@ -78,8 +102,15 @@ locals {
       { name = "QBT_REQUIRE_DATASET_HASH", value = "true" },
       { name = "QBT_REQUIRE_REGISTERED_DATASETS", value = "true" },
       { name = "QBT_REQUIRE_SORTED_DATA", value = "true" },
+      { name = "QBT_REQUIRE_STRICT_DATASET_SCHEMA", value = "true" },
       { name = "QBT_MAX_DATASET_BYTES", value = "250000000" },
-      { name = "QBT_SOURCE_REVISION", value = var.container_image },
+      { name = "QBT_MAX_SYMBOLS_PER_RUN", value = "250" },
+      { name = "QBT_MAX_EVENTS_PER_RUN", value = "2000000" },
+      { name = "QBT_MAX_UNSORTED_EVENTS_PER_RUN", value = "250000" },
+      { name = "QBT_MAX_PERSISTED_EQUITY_POINTS", value = "100000" },
+      { name = "QBT_SOURCE_REVISION", value = var.source_revision },
+      { name = "QBT_IMAGE_DIGEST", value = split("@", var.container_image)[1] },
+      { name = "QBT_TRACE_SAMPLE_RATIO", value = tostring(var.trace_sample_ratio) },
     ],
     var.otlp_endpoint == "" ? [] : [
       { name = "OTEL_EXPORTER_OTLP_ENDPOINT", value = var.otlp_endpoint },
@@ -87,16 +118,29 @@ locals {
   )
   api_environment = concat(local.common_environment, [
     { name = "QBT_AUTH_MODE", value = var.auth_mode },
+    { name = "QBT_API_THREAD_WORKERS", value = "8" },
+    { name = "QBT_MAX_ACTIVE_JOBS_PER_TENANT", value = "20" },
+    { name = "QBT_MAX_REQUEST_BYTES", value = "256000" },
+    { name = "QBT_MAX_ATTEMPTS_PER_JOB", value = "5" },
     { name = "QBT_OIDC_ISSUER", value = var.oidc_issuer },
     { name = "QBT_OIDC_AUDIENCE", value = var.oidc_audience },
     { name = "QBT_OIDC_JWKS_URL", value = var.oidc_jwks_url },
   ])
+  worker_environment = concat(local.common_environment, [
+    { name = "QBT_MAX_RUN_SECONDS", value = "3600" },
+    { name = "QBT_JOB_LEASE_SECONDS", value = "30" },
+    { name = "QBT_WORKER_POLL_SECONDS", value = "1" },
+  ])
   api_secrets = concat(
-    local.database_application_secrets,
+    local.database_api_secrets,
     var.auth_mode == "api-key" ? [
       {
         name      = "QBT_API_KEYS_JSON"
         valueFrom = var.api_keys_secret_arn
+      },
+      {
+        name      = "QBT_API_KEY_PEPPER"
+        valueFrom = var.api_key_pepper_secret_arn
       }
     ] : [],
   )
@@ -108,7 +152,7 @@ resource "aws_ecs_task_definition" "api" {
   network_mode             = "awsvpc"
   cpu                      = tostring(var.api_cpu)
   memory                   = tostring(var.api_memory)
-  execution_role_arn       = aws_iam_role.execution.arn
+  execution_role_arn       = aws_iam_role.api_execution.arn
   task_role_arn            = aws_iam_role.api_task.arn
 
   runtime_platform {
@@ -132,6 +176,7 @@ resource "aws_ecs_task_definition" "api" {
         protocol      = "tcp"
       }]
       linuxParameters = { initProcessEnabled = true }
+      stopTimeout     = 120
       healthCheck = {
         command = [
           "CMD-SHELL",
@@ -160,7 +205,7 @@ resource "aws_ecs_task_definition" "worker" {
   network_mode             = "awsvpc"
   cpu                      = tostring(var.worker_cpu)
   memory                   = tostring(var.worker_memory)
-  execution_role_arn       = aws_iam_role.execution.arn
+  execution_role_arn       = aws_iam_role.worker_execution.arn
   task_role_arn            = aws_iam_role.worker_task.arn
 
   runtime_platform {
@@ -184,9 +229,10 @@ resource "aws_ecs_task_definition" "worker" {
       readonlyRootFilesystem = true
       user                   = "10001:10001"
       command                = ["quant-backtester-worker", "--json-logs"]
-      environment            = local.common_environment
-      secrets                = local.database_application_secrets
+      environment            = local.worker_environment
+      secrets                = local.database_worker_secrets
       linuxParameters        = { initProcessEnabled = true }
+      stopTimeout            = 120
       mountPoints = [{
         sourceVolume  = "scratch"
         containerPath = "/tmp"
@@ -197,6 +243,13 @@ resource "aws_ecs_task_definition" "worker" {
         softLimit = 65536
         hardLimit = 65536
       }]
+      healthCheck = {
+        command     = ["CMD", "quant-backtester-worker", "--healthcheck"]
+        interval    = 30
+        timeout     = 10
+        retries     = 3
+        startPeriod = 30
+      }
       logConfiguration = {
         logDriver = "awslogs"
         options = {
@@ -215,7 +268,7 @@ resource "aws_ecs_task_definition" "migration" {
   network_mode             = "awsvpc"
   cpu                      = "512"
   memory                   = "1024"
-  execution_role_arn       = aws_iam_role.execution.arn
+  execution_role_arn       = aws_iam_role.migration_execution.arn
 
   container_definitions = jsonencode([
     {
@@ -227,7 +280,7 @@ resource "aws_ecs_task_definition" "migration" {
       command = [
         "sh",
         "-ceu",
-        "python -m alembic upgrade head && quant-backtester-db-bootstrap",
+        "python -m alembic upgrade head && quant-backtester-db-bootstrap --role api && quant-backtester-db-bootstrap --role worker",
       ]
       environment     = local.database_environment
       secrets         = concat(local.database_admin_secrets, local.database_bootstrap_secrets)
@@ -252,6 +305,9 @@ resource "aws_lb" "api" {
   subnets                    = aws_subnet.public[*].id
   enable_deletion_protection = true
   drop_invalid_header_fields = true
+  desync_mitigation_mode     = "strictest"
+  enable_http2               = true
+  preserve_host_header       = true
 
   access_logs {
     bucket  = aws_s3_bucket.access_logs.id
@@ -330,7 +386,7 @@ resource "aws_ecs_service" "api" {
 
   network_configuration {
     subnets          = aws_subnet.private[*].id
-    security_groups  = [aws_security_group.app.id]
+    security_groups  = [aws_security_group.api.id]
     assign_public_ip = false
   }
 
@@ -365,7 +421,7 @@ resource "aws_ecs_service" "worker" {
 
   network_configuration {
     subnets          = aws_subnet.private[*].id
-    security_groups  = [aws_security_group.app.id]
+    security_groups  = [aws_security_group.worker.id]
     assign_public_ip = false
   }
 
@@ -453,13 +509,51 @@ resource "aws_wafv2_web_acl" "api" {
     visibility_config {
       cloudwatch_metrics_enabled = true
       metric_name                = "${local.name}-common"
-      sampled_requests_enabled   = true
+      sampled_requests_enabled   = false
+    }
+  }
+
+  rule {
+    name     = "AWSManagedKnownBadInputs"
+    priority = 2
+    override_action {
+      none {}
+    }
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesKnownBadInputsRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name}-known-bad-inputs"
+      sampled_requests_enabled   = false
+    }
+  }
+
+  rule {
+    name     = "AWSManagedSQLi"
+    priority = 3
+    override_action {
+      none {}
+    }
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesSQLiRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name}-sqli"
+      sampled_requests_enabled   = false
     }
   }
 
   rule {
     name     = "PerIpRateLimit"
-    priority = 2
+    priority = 10
     action {
       block {}
     }
@@ -472,18 +566,35 @@ resource "aws_wafv2_web_acl" "api" {
     visibility_config {
       cloudwatch_metrics_enabled = true
       metric_name                = "${local.name}-rate-limit"
-      sampled_requests_enabled   = true
+      sampled_requests_enabled   = false
     }
   }
 
   visibility_config {
     cloudwatch_metrics_enabled = true
     metric_name                = "${local.name}-waf"
-    sampled_requests_enabled   = true
+    sampled_requests_enabled   = false
   }
 }
 
 resource "aws_wafv2_web_acl_association" "api" {
   resource_arn = aws_lb.api.arn
   web_acl_arn  = aws_wafv2_web_acl.api.arn
+}
+
+resource "aws_wafv2_web_acl_logging_configuration" "api" {
+  log_destination_configs = [aws_cloudwatch_log_group.waf.arn]
+  resource_arn            = aws_wafv2_web_acl.api.arn
+
+  redacted_fields {
+    single_header {
+      name = "authorization"
+    }
+  }
+
+  redacted_fields {
+    single_header {
+      name = "cookie"
+    }
+  }
 }

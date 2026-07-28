@@ -4,10 +4,8 @@ import hashlib
 import sqlite3
 from pathlib import Path
 
-import httpx2
 import pytest
 
-from quant_backtester.service.api import create_app
 from quant_backtester.service.auth import Authenticator
 from quant_backtester.service.settings import (
     ApiKeyIdentity,
@@ -45,11 +43,9 @@ def anyio_backend() -> str:
 
 
 @pytest.mark.anyio
-async def test_api_and_worker_complete_idempotent_job(tmp_path: Path) -> None:
+async def test_api_and_worker_complete_idempotent_job(tmp_path: Path, api_client) -> None:
     settings = _settings(tmp_path)
-    app = create_app(settings)
-    transport = httpx2.ASGITransport(app=app)
-    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with api_client(settings) as client:
         first = await client.post(
             "/v1/jobs",
             headers={"Idempotency-Key": "request-1"},
@@ -83,8 +79,11 @@ async def test_api_and_worker_complete_idempotent_job(tmp_path: Path) -> None:
                 lease_seconds=30,
             )
         )
-        assert worker.run_once()
-        assert not worker.run_once()
+        try:
+            assert worker.run_once()
+            assert not worker.run_once()
+        finally:
+            worker.close()
 
         job = await client.get(f"/v1/jobs/{job_id}")
         assert job.status_code == 200
@@ -110,9 +109,8 @@ async def test_api_and_worker_complete_idempotent_job(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_queued_job_can_be_canceled(tmp_path: Path) -> None:
-    transport = httpx2.ASGITransport(app=create_app(_settings(tmp_path)))
-    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
+async def test_queued_job_can_be_canceled(tmp_path: Path, api_client) -> None:
+    async with api_client(_settings(tmp_path)) as client:
         submitted = await client.post(
             "/v1/jobs",
             headers={"Idempotency-Key": "cancel-me"},
@@ -125,13 +123,15 @@ async def test_queued_job_can_be_canceled(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_registered_dataset_is_linked_and_hash_verified(tmp_path: Path) -> None:
+async def test_registered_dataset_is_linked_and_hash_verified(
+    tmp_path: Path,
+    api_client,
+) -> None:
     settings = _settings(tmp_path)
-    transport = httpx2.ASGITransport(app=create_app(settings))
     dataset_path = Path("data/sample_prices.csv")
     digest = hashlib.sha256(dataset_path.read_bytes()).hexdigest()
 
-    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with api_client(settings) as client:
         registered = await client.post(
             "/v1/datasets",
             json={
@@ -180,17 +180,22 @@ async def test_registered_dataset_is_linked_and_hash_verified(tmp_path: Path) ->
             require_dataset_hash=True,
         )
     )
-    assert worker.run_once()
+    try:
+        assert worker.run_once()
+    finally:
+        worker.close()
 
-    transport = httpx2.ASGITransport(app=create_app(settings))
-    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with api_client(settings) as client:
         run = await client.get(f"/v1/runs/{job_id}")
         assert run.status_code == 200
         assert run.json()["dataset_id"] == dataset_id
 
 
 @pytest.mark.anyio
-async def test_hashed_api_key_authentication_and_production_guard(tmp_path: Path) -> None:
+async def test_hashed_api_key_authentication_and_production_guard(
+    tmp_path: Path,
+    api_client,
+) -> None:
     token = "correct-horse-battery-staple"
     identity = ApiKeyIdentity(
         token_sha256=hashlib.sha256(token.encode()).hexdigest(),
@@ -210,8 +215,7 @@ async def test_hashed_api_key_authentication_and_production_guard(tmp_path: Path
     assert principal.tenant_id == "tenant-a"
     assert principal.permits("researcher")
 
-    transport = httpx2.ASGITransport(app=create_app(settings))
-    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with api_client(settings) as client:
         assert (await client.get("/v1/jobs")).status_code == 401
         assert (
             await client.get(
@@ -227,6 +231,18 @@ async def test_hashed_api_key_authentication_and_production_guard(tmp_path: Path
             artifact_root=tmp_path,
             environment="production",
             auth_mode="disabled",
+        )
+
+    with pytest.raises(ValueError, match="32-character pepper"):
+        ServiceSettings(
+            database_url="sqlite://",
+            data_root=Path.cwd(),
+            artifact_root=tmp_path,
+            environment="production",
+            auth_mode="api-key",
+            api_keys=(identity,),
+            dataset_bucket="immutable-datasets",
+            require_registered_datasets=True,
         )
 
     with pytest.raises(ValueError, match="disable local datasets"):

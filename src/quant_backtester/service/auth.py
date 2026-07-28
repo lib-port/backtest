@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import hmac
+import re
 from dataclasses import dataclass
 from typing import Any
 
 import jwt
 
-from quant_backtester.service.settings import ServiceSettings
+from quant_backtester.service.settings import KNOWN_ROLES, ServiceSettings
+
+CLAIM_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]*$")
 
 
 @dataclass(frozen=True)
@@ -17,7 +21,12 @@ class Principal:
     roles: frozenset[str]
 
     def permits(self, *required: str) -> bool:
-        return "admin" in self.roles or bool(self.roles.intersection(required))
+        if "admin" in self.roles:
+            return True
+        effective = set(self.roles)
+        if "researcher" in effective:
+            effective.add("observer")
+        return bool(effective.intersection(required))
 
 
 class AuthenticationError(ValueError):
@@ -28,7 +37,14 @@ class Authenticator:
     def __init__(self, settings: ServiceSettings) -> None:
         self._settings = settings
         self._jwks_client = (
-            jwt.PyJWKClient(settings.oidc_jwks_url)
+            jwt.PyJWKClient(
+                settings.oidc_jwks_url,
+                cache_keys=True,
+                max_cached_keys=16,
+                cache_jwk_set=True,
+                lifespan=300,
+                timeout=5,
+            )
             if settings.auth_mode == "oidc" and settings.oidc_jwks_url
             else None
         )
@@ -47,10 +63,14 @@ class Authenticator:
         return self._authenticate_oidc(token)
 
     def _authenticate_api_key(self, token: str) -> Principal:
-        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        pepper = self._settings.api_key_pepper or ""
+        digest = hashlib.sha256(f"{pepper}{token}".encode()).hexdigest()
+        now = dt.datetime.now(dt.UTC)
         for identity in self._settings.api_keys:
             if hmac.compare_digest(digest, identity.token_sha256):
                 if not all((identity.actor_id, identity.tenant_id, identity.role)):
+                    break
+                if identity.expires_at is not None and identity.expires_at <= now:
                     break
                 return Principal(
                     actor_id=identity.actor_id,
@@ -77,15 +97,28 @@ class Authenticator:
         return self._principal_from_claims(claims)
 
     def _principal_from_claims(self, claims: dict[str, Any]) -> Principal:
-        actor = str(claims.get("sub", "")).strip()
-        tenant = str(claims.get(self._settings.oidc_tenant_claim, "")).strip()
+        raw_actor = claims.get("sub")
+        raw_tenant = claims.get(self._settings.oidc_tenant_claim)
+        if not isinstance(raw_actor, str) or not isinstance(raw_tenant, str):
+            raise AuthenticationError("OIDC subject and tenant claims must be strings")
+        actor = raw_actor.strip()
+        tenant = raw_tenant.strip()
         raw_roles = claims.get(self._settings.oidc_roles_claim, ())
         if isinstance(raw_roles, str):
-            roles = frozenset(role for role in raw_roles.split() if role)
+            presented_roles = frozenset(role for role in raw_roles.split() if role)
         elif isinstance(raw_roles, list):
-            roles = frozenset(str(role) for role in raw_roles)
+            if not all(isinstance(role, str) for role in raw_roles):
+                raise AuthenticationError("OIDC roles must be strings")
+            presented_roles = frozenset(role.strip() for role in raw_roles if role.strip())
         else:
-            roles = frozenset()
-        if not actor or not tenant or not roles:
+            presented_roles = frozenset()
+        roles = frozenset(presented_roles.intersection(KNOWN_ROLES))
+        if (
+            not 1 <= len(actor) <= 256
+            or not 1 <= len(tenant) <= 128
+            or not CLAIM_IDENTIFIER_PATTERN.fullmatch(actor)
+            or not CLAIM_IDENTIFIER_PATTERN.fullmatch(tenant)
+            or not roles
+        ):
             raise AuthenticationError("OIDC token lacks subject, tenant, or roles")
         return Principal(actor_id=actor, tenant_id=tenant, roles=roles)

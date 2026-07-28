@@ -28,6 +28,32 @@ resource "aws_cloudwatch_log_metric_filter" "invariant_failures" {
   }
 }
 
+resource "aws_cloudwatch_log_metric_filter" "artifact_deferred" {
+  name           = "${local.name}-artifact-deferred"
+  log_group_name = aws_cloudwatch_log_group.worker.name
+  pattern        = "{ $.outcome = \"artifact_deferred\" }"
+
+  metric_transformation {
+    name          = "ArtifactPublicationDeferred"
+    namespace     = "QuantBacktester/${var.environment}"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_log_metric_filter" "lease_lost" {
+  name           = "${local.name}-lease-lost"
+  log_group_name = aws_cloudwatch_log_group.worker.name
+  pattern        = "{ $.outcome = \"lease_lost\" }"
+
+  metric_transformation {
+    name          = "JobLeaseLost"
+    namespace     = "QuantBacktester/${var.environment}"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
 resource "aws_cloudwatch_metric_alarm" "job_failures" {
   alarm_name          = "${local.name}-job-failures"
   alarm_description   = "At least one worker attempt failed in five minutes."
@@ -52,6 +78,34 @@ resource "aws_cloudwatch_metric_alarm" "invariant_failures" {
   period              = 60
   statistic           = "Sum"
   threshold           = 0
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.alarm_actions
+}
+
+resource "aws_cloudwatch_metric_alarm" "artifact_deferred" {
+  alarm_name          = "${local.name}-artifact-publication-deferred"
+  alarm_description   = "A persisted run result could not be published to immutable storage."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ArtifactPublicationDeferred"
+  namespace           = "QuantBacktester/${var.environment}"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.alarm_actions
+}
+
+resource "aws_cloudwatch_metric_alarm" "lease_lost" {
+  alarm_name          = "${local.name}-job-lease-lost"
+  alarm_description   = "Workers are losing fenced database leases during execution."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "JobLeaseLost"
+  namespace           = "QuantBacktester/${var.environment}"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 2
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
 }
@@ -108,6 +162,44 @@ resource "aws_cloudwatch_metric_alarm" "queue_age" {
 
   dimensions = {
     QueueName = aws_sqs_queue.jobs.name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "api_latency" {
+  alarm_name          = "${local.name}-api-p95-latency"
+  alarm_description   = "API target p95 response time is above two seconds."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  metric_name         = "TargetResponseTime"
+  namespace           = "AWS/ApplicationELB"
+  period              = 300
+  extended_statistic  = "p95"
+  threshold           = 2
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.alarm_actions
+
+  dimensions = {
+    LoadBalancer = aws_lb.api.arn_suffix
+    TargetGroup  = aws_lb_target_group.api.arn_suffix
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "worker_running_tasks" {
+  alarm_name          = "${local.name}-worker-running-tasks"
+  alarm_description   = "No worker task is running while the service is enabled."
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "RunningTaskCount"
+  namespace           = "ECS/ContainerInsights"
+  period              = 60
+  statistic           = "Minimum"
+  threshold           = var.bootstrap_mode ? 0 : 1
+  treat_missing_data  = var.bootstrap_mode ? "notBreaching" : "breaching"
+  alarm_actions       = local.alarm_actions
+
+  dimensions = {
+    ClusterName = aws_ecs_cluster.this.name
+    ServiceName = aws_ecs_service.worker.name
   }
 }
 
@@ -180,6 +272,21 @@ resource "aws_cloudwatch_dashboard" "operations" {
             ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", aws_lb.api.arn_suffix],
             [".", "HTTPCode_Target_5XX_Count", ".", "."],
             [".", "TargetResponseTime", ".", ".", { stat = "p95" }],
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Worker correctness signals"
+          region = var.aws_region
+          metrics = [
+            ["QuantBacktester/${var.environment}", "JobFailures"],
+            [".", "ArtifactPublicationDeferred"],
+            [".", "JobLeaseLost"],
+            [".", "InvariantFailures"],
           ]
         }
       },

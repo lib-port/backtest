@@ -23,7 +23,7 @@ test:
 	HYPOTHESIS_STORAGE_DIRECTORY=/tmp/quant-backtester-hypothesis $(PYTHON) -m pytest
 
 test-cov:
-	HYPOTHESIS_STORAGE_DIRECTORY=/tmp/quant-backtester-hypothesis $(PYTHON) -m pytest --cov=quant_backtester --cov-report=term-missing --cov-report=xml
+	HYPOTHESIS_STORAGE_DIRECTORY=/tmp/quant-backtester-hypothesis $(PYTHON) -m pytest --cov=quant_backtester --cov-branch --cov-report=term-missing --cov-report=xml
 
 check: lint type test
 

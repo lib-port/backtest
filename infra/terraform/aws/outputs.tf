@@ -28,8 +28,13 @@ output "private_subnet_ids" {
   value = aws_subnet.private[*].id
 }
 
-output "application_security_group_id" {
-  value = aws_security_group.app.id
+output "api_security_group_id" {
+  value = aws_security_group.api.id
+}
+
+output "worker_security_group_id" {
+  description = "Use this security group when running the migration task in private subnets."
+  value       = aws_security_group.worker.id
 }
 
 output "database_endpoint" {

@@ -11,9 +11,12 @@ from quant_backtester.config import (
     BacktestConfig,
     DataConfig,
     DuplicatePolicy,
+    EndOfRunConfig,
     ExecutionConfig,
     MetricsConfig,
     MicrostructureConfig,
+    PendingOrderPolicy,
+    PositionEndPolicy,
     RiskConfig,
     load_config_file,
 )
@@ -102,7 +105,19 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--stop-loss", type=float, default=None)
     common.add_argument("--max-dd", type=float, default=None)
     common.add_argument("--max-gross-exposure", type=float, default=None)
+    common.add_argument("--max-net-exposure", type=float, default=None)
+    common.add_argument("--max-order-notional", type=float, default=None)
     common.add_argument("--max-leverage", type=float, default=None)
+    common.add_argument("--max-daily-loss", type=float, default=None)
+    common.add_argument("--no-short", action="store_true", default=None)
+
+    # terminal valuation semantics
+    common.add_argument("--pending-order-policy", choices=("cancel", "retain"), default=None)
+    common.add_argument(
+        "--position-end-policy",
+        choices=("mark_to_market", "liquidate", "require_flat"),
+        default=None,
+    )
 
     # data and metric assumptions
     common.add_argument("--source-timezone", default=None)
@@ -153,6 +168,7 @@ def main() -> None:
     file_risk = file_cfg.get("risk", {})
     file_data = file_cfg.get("data", {})
     file_metrics = file_cfg.get("metrics", {})
+    file_end_of_run = file_cfg.get("end_of_run", {})
     if not isinstance(file_exec, dict):
         parser.error("'execution' in config file must be a mapping")
     if not isinstance(file_micro, dict):
@@ -163,6 +179,8 @@ def main() -> None:
         parser.error("'data' in config file must be a mapping")
     if not isinstance(file_metrics, dict):
         parser.error("'metrics' in config file must be a mapping")
+    if not isinstance(file_end_of_run, dict):
+        parser.error("'end_of_run' in config file must be a mapping")
 
     symbols = args.symbols
     if symbols is None:
@@ -235,7 +253,25 @@ def main() -> None:
                     )
                 )
             ),
+            max_net_exposure=(
+                None
+                if _pick(args.max_net_exposure, file_risk.get("max_net_exposure"), None) is None
+                else float(_pick(args.max_net_exposure, file_risk.get("max_net_exposure"), None))
+            ),
+            max_order_notional=(
+                None
+                if _pick(args.max_order_notional, file_risk.get("max_order_notional"), None) is None
+                else float(
+                    _pick(args.max_order_notional, file_risk.get("max_order_notional"), None)
+                )
+            ),
             max_leverage=float(_pick(args.max_leverage, file_risk.get("max_leverage"), 1.0)),
+            max_daily_loss_pct=(
+                None
+                if _pick(args.max_daily_loss, file_risk.get("max_daily_loss_pct"), None) is None
+                else float(_pick(args.max_daily_loss, file_risk.get("max_daily_loss_pct"), None))
+            ),
+            allow_short=(False if args.no_short else bool(file_risk.get("allow_short", True))),
         )
         data_cfg = DataConfig(
             source_timezone=str(
@@ -248,6 +284,8 @@ def main() -> None:
             chunksize=int(file_data.get("chunksize", 50_000)),
             require_sorted=bool(file_data.get("require_sorted", True)),
             max_events=int(file_data.get("max_events", 2_000_000)),
+            strict_schema=bool(file_data.get("strict_schema", True)),
+            require_all_symbols=bool(file_data.get("require_all_symbols", True)),
         )
         raw_periods = _pick(
             args.periods_per_year,
@@ -263,6 +301,24 @@ def main() -> None:
                 )
             ),
             periods_per_year=None if raw_periods is None else float(raw_periods),
+        )
+        end_of_run_cfg = EndOfRunConfig(
+            pending_order_policy=cast(
+                PendingOrderPolicy,
+                _pick(
+                    args.pending_order_policy,
+                    file_end_of_run.get("pending_order_policy"),
+                    "cancel",
+                ),
+            ),
+            position_policy=cast(
+                PositionEndPolicy,
+                _pick(
+                    args.position_end_policy,
+                    file_end_of_run.get("position_policy"),
+                    "mark_to_market",
+                ),
+            ),
         )
     except (TypeError, ValueError) as exc:
         parser.error(f"Invalid execution/risk config: {exc}")
@@ -297,6 +353,7 @@ def main() -> None:
             risk=risk_cfg,
             data=data_cfg,
             metrics=metrics_cfg,
+            end_of_run=end_of_run_cfg,
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -383,7 +440,11 @@ def main() -> None:
             "symbols",
             "final_equity",
             "total_return",
+            "annualized_return",
+            "annualized_volatility",
             "sharpe",
+            "sortino",
+            "calmar",
             "max_drawdown",
             "halted",
             "halt_reason",

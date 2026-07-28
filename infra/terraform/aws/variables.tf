@@ -42,9 +42,24 @@ variable "container_image" {
   }
 }
 
+variable "source_revision" {
+  type        = string
+  description = "Full Git commit SHA used to build container_image."
+
+  validation {
+    condition     = can(regex("^[0-9a-f]{40}$", var.source_revision))
+    error_message = "source_revision must be a full lowercase 40-character Git SHA."
+  }
+}
+
 variable "certificate_arn" {
   type        = string
   description = "ACM certificate ARN for the HTTPS listener."
+
+  validation {
+    condition     = can(regex("^arn:[^:]+:acm:", var.certificate_arn))
+    error_message = "certificate_arn must be an ACM certificate ARN."
+  }
 }
 
 variable "api_hostname" {
@@ -80,6 +95,29 @@ variable "api_keys_secret_arn" {
   description = "Optional Secrets Manager ARN whose secret value is QBT_API_KEYS_JSON."
   default     = null
   nullable    = true
+
+  validation {
+    condition = (
+      var.api_keys_secret_arn == null
+      || can(regex("^arn:[^:]+:secretsmanager:", var.api_keys_secret_arn))
+    )
+    error_message = "api_keys_secret_arn must be null or a Secrets Manager ARN."
+  }
+}
+
+variable "api_key_pepper_secret_arn" {
+  type        = string
+  description = "Optional Secrets Manager ARN whose value is QBT_API_KEY_PEPPER."
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = (
+      var.api_key_pepper_secret_arn == null
+      || can(regex("^arn:[^:]+:secretsmanager:", var.api_key_pepper_secret_arn))
+    )
+    error_message = "api_key_pepper_secret_arn must be null or a Secrets Manager ARN."
+  }
 }
 
 variable "oidc_issuer" {
@@ -110,13 +148,60 @@ variable "db_username" {
   default = "quant"
 }
 
-variable "application_db_secret_arn" {
+variable "api_db_secret_arn" {
   type        = string
-  description = "Secrets Manager ARN containing JSON username/password for the non-owner runtime role."
+  description = "Secrets Manager ARN containing username/password for the RLS-bound API role."
 
   validation {
-    condition     = can(regex("^arn:[^:]+:secretsmanager:", var.application_db_secret_arn))
-    error_message = "application_db_secret_arn must be a Secrets Manager ARN."
+    condition     = can(regex("^arn:[^:]+:secretsmanager:", var.api_db_secret_arn))
+    error_message = "api_db_secret_arn must be a Secrets Manager ARN."
+  }
+}
+
+variable "worker_db_secret_arn" {
+  type        = string
+  description = "Secrets Manager ARN containing username/password for the worker role."
+
+  validation {
+    condition     = can(regex("^arn:[^:]+:secretsmanager:", var.worker_db_secret_arn))
+    error_message = "worker_db_secret_arn must be a Secrets Manager ARN."
+  }
+}
+
+variable "api_secrets_kms_key_arns" {
+  type        = list(string)
+  description = "Customer-managed KMS keys used by externally managed API/authentication secrets."
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for arn in var.api_secrets_kms_key_arns : can(regex("^arn:[^:]+:kms:", arn))
+    ])
+    error_message = "api_secrets_kms_key_arns must contain only KMS key ARNs."
+  }
+}
+
+variable "worker_secrets_kms_key_arns" {
+  type        = list(string)
+  description = "Customer-managed KMS keys used by the externally managed worker database secret."
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for arn in var.worker_secrets_kms_key_arns : can(regex("^arn:[^:]+:kms:", arn))
+    ])
+    error_message = "worker_secrets_kms_key_arns must contain only KMS key ARNs."
+  }
+}
+
+variable "trace_sample_ratio" {
+  type        = number
+  description = "Parent-based OpenTelemetry trace sampling ratio."
+  default     = 0.1
+
+  validation {
+    condition     = var.trace_sample_ratio >= 0 && var.trace_sample_ratio <= 1
+    error_message = "trace_sample_ratio must be in [0, 1]."
   }
 }
 
@@ -149,6 +234,17 @@ variable "dataset_retention_days" {
   validation {
     condition     = var.dataset_retention_days >= 1
     error_message = "dataset_retention_days must be at least one day."
+  }
+}
+
+variable "artifact_retention_days" {
+  type        = number
+  description = "Default S3 Object Lock governance retention for result artifacts."
+  default     = 365
+
+  validation {
+    condition     = var.artifact_retention_days >= 1
+    error_message = "artifact_retention_days must be at least one day."
   }
 }
 
@@ -220,6 +316,11 @@ variable "otlp_endpoint" {
   type        = string
   description = "Optional HTTPS OTLP endpoint for application traces."
   default     = ""
+
+  validation {
+    condition     = var.otlp_endpoint == "" || startswith(var.otlp_endpoint, "https://")
+    error_message = "otlp_endpoint must be empty or use HTTPS."
+  }
 }
 
 variable "tags" {

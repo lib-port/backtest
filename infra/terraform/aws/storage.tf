@@ -48,7 +48,8 @@ resource "aws_kms_alias" "data" {
 }
 
 resource "aws_s3_bucket" "artifacts" {
-  bucket = "${local.name}-${data.aws_caller_identity.current.account_id}-artifacts"
+  bucket              = "${local.name}-${data.aws_caller_identity.current.account_id}-artifacts"
+  object_lock_enabled = true
 
   lifecycle {
     prevent_destroy = true
@@ -81,6 +82,19 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
       sse_algorithm     = "aws:kms"
     }
     bucket_key_enabled = true
+  }
+}
+
+resource "aws_s3_bucket_object_lock_configuration" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+
+  depends_on = [aws_s3_bucket_versioning.artifacts]
+
+  rule {
+    default_retention {
+      mode = "GOVERNANCE"
+      days = var.artifact_retention_days
+    }
   }
 }
 

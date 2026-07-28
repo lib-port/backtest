@@ -30,7 +30,11 @@ RESULT_COLUMNS = [
     "initial_cash",
     "final_equity",
     "total_return",
+    "annualized_return",
+    "annualized_volatility",
     "sharpe",
+    "sortino",
+    "calmar",
     "max_drawdown",
     "total_commission",
     "total_slippage_cost",
@@ -86,11 +90,32 @@ def run_parameter_sweep(
     *,
     persist: bool = True,
 ) -> pd.DataFrame:
+    database = Database(cfg.database_url) if persist else None
+    try:
+        return _run_parameter_sweep_impl(
+            cfg,
+            short_windows,
+            long_windows,
+            export_csv,
+            database=database,
+        )
+    finally:
+        if database is not None:
+            database.close()
+
+
+def _run_parameter_sweep_impl(
+    cfg: BacktestConfig,
+    short_windows: list[int],
+    long_windows: list[int],
+    export_csv: str | None,
+    *,
+    database: Database | None,
+) -> pd.DataFrame:
     destination = Path(export_csv or (Path(cfg.out_dir) / "sweep_results.csv"))
     valid_pairs = _valid_param_pairs(short_windows, long_windows)
     events = _load_events(cfg)
     source = InMemoryDataHandler(events)
-    database = Database(cfg.database_url) if persist else None
     if database is not None:
         database.prepare_schema()
 
@@ -100,7 +125,7 @@ def run_parameter_sweep(
             "event": {
                 "run_name": cfg.run_name,
                 "parameter_count": len(valid_pairs),
-                "persist": persist,
+                "persist": database is not None,
             }
         },
     )
@@ -128,7 +153,7 @@ def run_parameter_sweep(
 
     if results:
         frame = pd.DataFrame(results).sort_values(
-            ["total_return", "sharpe"],
+            ["sharpe", "sortino", "total_return"],
             ascending=False,
         )
     else:
@@ -167,6 +192,42 @@ def run_walk_forward(
     allow_test_overlap: bool = False,
     persist: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
+    database = Database(cfg.database_url) if persist else None
+    try:
+        return _run_walk_forward_impl(
+            cfg,
+            short_windows,
+            long_windows,
+            train_days,
+            test_days,
+            step_days,
+            export_csv,
+            purge_days=purge_days,
+            embargo_days=embargo_days,
+            warmup_days=warmup_days,
+            allow_test_overlap=allow_test_overlap,
+            database=database,
+        )
+    finally:
+        if database is not None:
+            database.close()
+
+
+def _run_walk_forward_impl(
+    cfg: BacktestConfig,
+    short_windows: list[int],
+    long_windows: list[int],
+    train_days: int,
+    test_days: int,
+    step_days: int,
+    export_csv: str | None,
+    *,
+    purge_days: int,
+    embargo_days: int,
+    warmup_days: int | None,
+    allow_test_overlap: bool,
+    database: Database | None,
+) -> tuple[pd.DataFrame, dict[str, object]]:
     _validate_walk_forward(
         train_days=train_days,
         test_days=test_days,
@@ -190,7 +251,6 @@ def run_walk_forward(
         max(long_window for _, long_window in valid_pairs) if warmup_days is None else warmup_days
     )
 
-    database = Database(cfg.database_url) if persist else None
     if database is not None:
         database.prepare_schema()
 
@@ -207,7 +267,7 @@ def run_walk_forward(
                 "embargo_days": embargo_days,
                 "warmup_days": resolved_warmup_days,
                 "total_days": len(unique_dates),
-                "persist": persist,
+                "persist": database is not None,
             }
         },
     )
@@ -283,6 +343,7 @@ def run_walk_forward(
             "best_long_window": best_pair[1],
             "in_sample_total_return": _number(best_result, "total_return"),
             "in_sample_sharpe": _number(best_result, "sharpe"),
+            "in_sample_sortino": _number(best_result, "sortino"),
             "in_sample_max_drawdown": _number(best_result, "max_drawdown"),
         }
         out_of_sample["extra"] = out_of_sample_extra
@@ -304,9 +365,11 @@ def run_walk_forward(
                 "best_long_window": best_pair[1],
                 "train_total_return": _number(best_result, "total_return"),
                 "train_sharpe": _number(best_result, "sharpe"),
+                "train_sortino": _number(best_result, "sortino"),
                 "train_max_drawdown": _number(best_result, "max_drawdown"),
                 "oos_total_return": _number(out_of_sample, "total_return"),
                 "oos_sharpe": _number(out_of_sample, "sharpe"),
+                "oos_sortino": _number(out_of_sample, "sortino"),
                 "oos_max_drawdown": _number(out_of_sample, "max_drawdown"),
                 "oos_halted": bool(out_of_sample["halted"]),
                 "oos_halt_reason": out_of_sample["halt_reason"],
@@ -344,11 +407,12 @@ def _events_for_dates(
     return tuple(event for day in dates for event in events_by_date.get(day, ()))
 
 
-def _score(result: dict[str, object]) -> tuple[float, float, float]:
+def _score(result: dict[str, object]) -> tuple[float, float, float, float]:
     return (
-        _number(result, "total_return"),
         _number(result, "sharpe"),
+        _number(result, "sortino"),
         -_number(result, "max_drawdown"),
+        _number(result, "total_return"),
     )
 
 
@@ -393,6 +457,7 @@ def _walk_forward_summary(
             "oos_compounded_return": 0.0,
             "oos_mean_return": 0.0,
             "oos_mean_sharpe": 0.0,
+            "oos_mean_sortino": 0.0,
             "oos_max_drawdown": 0.0,
         }
 
@@ -406,6 +471,7 @@ def _walk_forward_summary(
     (common_short, common_long), common_count = pair_counter.most_common(1)[0]
     returns = frame["oos_total_return"].astype(float)
     sharpes = frame["oos_sharpe"].astype(float)
+    sortinos = frame["oos_sortino"].astype(float)
     drawdowns = frame["oos_max_drawdown"].astype(float)
     return {
         "window_count": int(len(frame)),
@@ -415,5 +481,6 @@ def _walk_forward_summary(
         "oos_compounded_return": float((1.0 + returns).prod() - 1.0),
         "oos_mean_return": float(returns.mean()),
         "oos_mean_sharpe": float(sharpes.mean()),
+        "oos_mean_sortino": float(sortinos.mean()),
         "oos_max_drawdown": float(drawdowns.max()),
     }

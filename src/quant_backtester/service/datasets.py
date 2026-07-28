@@ -51,7 +51,7 @@ class DatasetRepository:
         metadata: dict[str, object],
     ) -> DatasetSnapshot:
         now = dt.datetime.now(dt.UTC)
-        with self.database.transaction() as session:
+        with self.database.transaction(tenant_id=principal.tenant_id) as session:
             if not self.database.is_sqlite:
                 session.execute(
                     text("SELECT pg_advisory_xact_lock(hashtextextended(:tenant_id, 1))"),
@@ -96,7 +96,7 @@ class DatasetRepository:
             return DatasetSnapshot.from_model(dataset)
 
     def get(self, dataset_id: str, *, tenant_id: str) -> DatasetSnapshot | None:
-        with self.database.session() as session:
+        with self.database.session(tenant_id=tenant_id) as session:
             dataset = session.scalar(
                 select(DatasetVersion).where(
                     DatasetVersion.id == dataset_id,
@@ -114,7 +114,7 @@ class DatasetRepository:
     ) -> list[DatasetSnapshot]:
         if not 1 <= limit <= 1_000 or offset < 0:
             raise ValueError("Invalid pagination")
-        with self.database.session() as session:
+        with self.database.session(tenant_id=tenant_id) as session:
             datasets = session.scalars(
                 select(DatasetVersion)
                 .where(DatasetVersion.tenant_id == tenant_id)
