@@ -6,6 +6,14 @@ import logging
 import sys
 from typing import Any
 
+from quant_backtester.logging_context import (
+    current_trace_ids,
+    job_id_var,
+    request_id_var,
+    run_id_var,
+    tenant_id_var,
+)
+
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -18,6 +26,18 @@ class JsonFormatter(logging.Formatter):
         event = getattr(record, "event", None)
         if isinstance(event, dict):
             payload.update(event)
+        for key, value in (
+            ("request_id", request_id_var.get()),
+            ("tenant_id", tenant_id_var.get()),
+            ("job_id", job_id_var.get()),
+            ("run_id", run_id_var.get()),
+        ):
+            if value is not None:
+                payload[key] = value
+        trace_id, span_id = current_trace_ids()
+        if trace_id is not None:
+            payload["trace_id"] = trace_id
+            payload["span_id"] = span_id
         return json.dumps(payload, default=str)
 
 

@@ -1,47 +1,88 @@
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import dataclass, field
+from decimal import ROUND_HALF_EVEN, Decimal
 
 from quant_backtester.config import RiskConfig
-from quant_backtester.events import FillEvent, Side
+from quant_backtester.events import EquityPoint, FillEvent, Side, as_utc
+
+ACCOUNTING_QUANTUM = Decimal("0.00000001")
+
+
+def _decimal(value: float | int | str | Decimal) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
+def _money(value: Decimal) -> Decimal:
+    return value.quantize(ACCOUNTING_QUANTUM, rounding=ROUND_HALF_EVEN)
+
+
+@dataclass(frozen=True)
+class JournalEntry:
+    """A balanced monetary journal entry created from an execution."""
+
+    timestamp: dt.datetime
+    transaction_id: str
+    debit_account: str
+    credit_account: str
+    amount: Decimal
+    symbol: str | None = None
 
 
 @dataclass
 class Position:
     quantity: int = 0
-    avg_cost: float = 0.0  # average entry cost per share
+    _avg_cost: Decimal = field(default=Decimal("0"), repr=False)
+    _realized_pnl: Decimal = field(default=Decimal("0"), repr=False)
 
-    def update_on_fill(self, fill: FillEvent) -> None:
-        signed_qty = fill.quantity if fill.side == Side.BUY else -fill.quantity
-        new_qty = self.quantity + signed_qty
+    @property
+    def avg_cost(self) -> float:
+        return float(self._avg_cost)
 
-        # If position flips sign or goes to zero, reset avg cost on the remainder.
+    @property
+    def realized_pnl(self) -> float:
+        return float(self._realized_pnl)
+
+    def update_on_fill(self, fill: FillEvent) -> Decimal:
+        signed_qty = fill.quantity * fill.side.sign
+        old_qty = self.quantity
+        new_qty = old_qty + signed_qty
+        fill_price = _decimal(fill.fill_price)
+        realized = Decimal("0")
+
+        if old_qty != 0 and old_qty * signed_qty < 0:
+            closed_quantity = min(abs(old_qty), abs(signed_qty))
+            if old_qty > 0:
+                realized = (fill_price - self._avg_cost) * closed_quantity
+            else:
+                realized = (self._avg_cost - fill_price) * closed_quantity
+            self._realized_pnl = _money(self._realized_pnl + realized)
+
         if new_qty == 0:
             self.quantity = 0
-            self.avg_cost = 0.0
-            return
+            self._avg_cost = Decimal("0")
+            return _money(realized)
 
-        # If adding in same direction, update weighted average cost
-        if (
-            self.quantity == 0
-            or (self.quantity > 0 and signed_qty > 0)
-            or (self.quantity < 0 and signed_qty < 0)
-        ):
-            total_cost = self.avg_cost * abs(self.quantity) + fill.fill_price * abs(signed_qty)
+        adding_same_direction = (
+            old_qty == 0 or (old_qty > 0 and signed_qty > 0) or (old_qty < 0 and signed_qty < 0)
+        )
+        if adding_same_direction:
+            total_cost = self._avg_cost * abs(old_qty) + fill_price * abs(signed_qty)
             self.quantity = new_qty
-            self.avg_cost = total_cost / abs(new_qty)
-            return
+            self._avg_cost = _money(total_cost / abs(new_qty))
+            return _money(realized)
 
-        # Reducing or flipping: keep avg cost for remaining shares if not flipped
-        # If flipped, set avg cost to fill price for new position direction.
-        if (self.quantity > 0 and new_qty > 0) or (self.quantity < 0 and new_qty < 0):
+        if old_qty * new_qty > 0:
             self.quantity = new_qty
-            # avg_cost unchanged
-            return
+            return _money(realized)
 
-        # Flipped sign
+        # A single fill closed the old position and opened one in the other direction.
         self.quantity = new_qty
-        self.avg_cost = fill.fill_price
+        self._avg_cost = _money(fill_price)
+        return _money(realized)
 
 
 @dataclass
@@ -52,109 +93,258 @@ class RiskState:
 
 @dataclass
 class MultiAssetPortfolio:
+    """Fixed-precision portfolio accounting with replay-safe fills."""
+
     initial_cash: float
     risk_cfg: RiskConfig
 
-    cash: float = field(init=False)
     positions: dict[str, Position] = field(default_factory=dict, init=False)
     last_mid: dict[str, float] = field(default_factory=dict, init=False)
     equity_curve: list[float] = field(default_factory=list, init=False)
+    equity_points: list[EquityPoint] = field(default_factory=list, init=False)
     peak_equity: float = field(default=0.0, init=False)
-    _equity: float = field(default=0.0, init=False)
     risk_state: RiskState = field(default_factory=RiskState, init=False)
+    journal: list[JournalEntry] = field(default_factory=list, init=False)
 
-    # simple accounting
-    total_commission: float = field(default=0.0, init=False)
-    total_slippage_cost: float = field(default=0.0, init=False)  # absolute cost vs mid
+    _cash: Decimal = field(init=False, repr=False)
+    _equity: Decimal = field(init=False, repr=False)
+    _marks: dict[str, Decimal] = field(default_factory=dict, init=False, repr=False)
+    _total_commission: Decimal = field(default=Decimal("0"), init=False, repr=False)
+    _total_slippage_cost: Decimal = field(default=Decimal("0"), init=False, repr=False)
+    _applied_execution_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    _anonymous_fill_sequence: int = field(default=1, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self.cash = float(self.initial_cash)
-        self.peak_equity = self.initial_cash
-        self._equity = self.initial_cash
+        self._cash = _money(_decimal(self.initial_cash))
+        self._equity = self._cash
+        self.peak_equity = float(self._equity)
+
+    @property
+    def cash(self) -> float:
+        return float(self._cash)
+
+    @property
+    def total_commission(self) -> float:
+        return float(self._total_commission)
+
+    @property
+    def total_slippage_cost(self) -> float:
+        return float(self._total_slippage_cost)
+
+    @property
+    def realized_pnl(self) -> float:
+        return float(
+            sum((position._realized_pnl for position in self.positions.values()), Decimal(0))
+        )
 
     def get_position(self, symbol: str) -> Position:
-        if symbol not in self.positions:
-            self.positions[symbol] = Position()
-        return self.positions[symbol]
+        normalized = symbol.strip().upper()
+        if normalized not in self.positions:
+            self.positions[normalized] = Position()
+        return self.positions[normalized]
 
-    def can_place_order(self, symbol: str, side: Side, qty: int) -> bool:
-        pos = self.get_position(symbol)
-        signed = qty if side == Side.BUY else -qty
-        proposed = pos.quantity + signed
-        return abs(proposed) <= self.risk_cfg.max_position_per_symbol
+    def gross_exposure(self) -> float:
+        gross = sum(
+            abs(position.quantity) * self._marks.get(symbol, Decimal("0"))
+            for symbol, position in self.positions.items()
+        )
+        return float(gross)
 
-    def on_fill(self, fill: FillEvent) -> None:
-        pos = self.get_position(fill.symbol)
-        old_qty = pos.quantity
-        signed_qty = fill.quantity if fill.side == Side.BUY else -fill.quantity
+    def can_place_order(
+        self,
+        symbol: str,
+        side: Side,
+        qty: int,
+        *,
+        pending_signed_quantity: int = 0,
+    ) -> bool:
+        if qty <= 0 or self.risk_state.trading_halted:
+            return False
+        normalized = symbol.strip().upper()
+        position = self.get_position(normalized)
+        proposed = position.quantity + pending_signed_quantity + (qty * side.sign)
+        if abs(proposed) > self.risk_cfg.max_position_per_symbol:
+            return False
 
-        # cash movement: BUY decreases cash, SELL increases cash
-        cash_delta = -(fill.fill_price * signed_qty) - fill.commission
-        self.cash += cash_delta
+        mark = self._marks.get(normalized)
+        if mark is None:
+            return True
+        current_symbol_exposure = abs(position.quantity + pending_signed_quantity) * mark
+        proposed_symbol_exposure = abs(proposed) * mark
+        proposed_gross = (
+            _decimal(self.gross_exposure()) - current_symbol_exposure + proposed_symbol_exposure
+        )
+        if self.risk_cfg.max_gross_exposure is not None and proposed_gross > _decimal(
+            self.risk_cfg.max_gross_exposure
+        ):
+            return False
+        equity = max(self._equity, Decimal("0"))
+        if equity == 0:
+            return proposed_gross == 0
+        return proposed_gross <= equity * _decimal(self.risk_cfg.max_leverage)
 
-        self.total_commission += fill.commission
-        # slippage cost vs mid: BUY pays +slip, SELL pays -slip (cost is side.sign * slip)
-        # Convert to absolute cost in currency:
-        self.total_slippage_cost += fill.slippage * signed_qty  # signed_qty carries side
-
-        pos.update_on_fill(fill)
-
-        # Keep equity updated in O(1) when mid price is available.
-        mid = self.last_mid.get(fill.symbol)
-        if mid is None:
-            self._equity = self._recompute_equity()
-            return
-        qty_delta = pos.quantity - old_qty
-        self._equity += cash_delta + (qty_delta * mid)
-
-    def mark_to_market(self, symbol: str, mid: float) -> float:
-        prev_mid = self.last_mid.get(symbol)
-        self.last_mid[symbol] = mid
-
-        pos = self.positions.get(symbol)
-        qty = pos.quantity if pos is not None else 0
-        if prev_mid is None:
-            self._equity += qty * mid
+    def on_fill(self, fill: FillEvent) -> bool:
+        """Apply a fill once. Returns False when an execution is a replay."""
+        if fill.execution_id is not None:
+            if fill.execution_id in self._applied_execution_ids:
+                return False
+            self._applied_execution_ids.add(fill.execution_id)
+            transaction_id = fill.execution_id
         else:
-            self._equity += qty * (mid - prev_mid)
+            transaction_id = f"anonymous-fill-{self._anonymous_fill_sequence}"
+            self._anonymous_fill_sequence += 1
 
-        equity = self._equity
-        self.equity_curve.append(equity)
+        position = self.get_position(fill.symbol)
+        signed_quantity = fill.quantity * fill.side.sign
+        principal = _money(_decimal(fill.fill_price) * fill.quantity)
+        commission = _money(_decimal(fill.commission))
+        cash_delta = principal * (-1 if fill.side == Side.BUY else 1) - commission
+
+        self._cash = _money(self._cash + cash_delta)
+        self._total_commission = _money(self._total_commission + commission)
+        slippage_cost = _decimal(fill.slippage) * signed_quantity
+        self._total_slippage_cost = _money(self._total_slippage_cost + slippage_cost)
+        realized = position.update_on_fill(fill)
+
+        if fill.side == Side.BUY:
+            self._post(
+                fill.timestamp,
+                transaction_id,
+                f"inventory:{fill.symbol}",
+                "cash",
+                principal,
+                fill.symbol,
+            )
+        else:
+            self._post(
+                fill.timestamp,
+                transaction_id,
+                "cash",
+                f"inventory:{fill.symbol}",
+                principal,
+                fill.symbol,
+            )
+        if commission:
+            self._post(
+                fill.timestamp,
+                f"{transaction_id}:commission",
+                "expense:commission",
+                "cash",
+                commission,
+                fill.symbol,
+            )
+        if realized:
+            pnl_account = "income:realized-pnl" if realized > 0 else "expense:realized-pnl"
+            offset = "inventory:pnl-offset"
+            self._post(
+                fill.timestamp,
+                f"{transaction_id}:realized-pnl",
+                offset if realized > 0 else pnl_account,
+                pnl_account if realized > 0 else offset,
+                abs(realized),
+                fill.symbol,
+            )
+
+        # Recompute from the ledger-backed cash balance and current marks. This
+        # deliberately favors exact reconciliation over an accumulation shortcut
+        # whose per-event rounding can drift from the independently derived value.
+        self._equity = self._recompute_equity()
+        self.assert_reconciled()
+        return True
+
+    def _post(
+        self,
+        timestamp: dt.datetime,
+        transaction_id: str,
+        debit_account: str,
+        credit_account: str,
+        amount: Decimal,
+        symbol: str | None,
+    ) -> None:
+        if amount < 0:
+            raise ValueError("journal amount must not be negative")
+        self.journal.append(
+            JournalEntry(
+                timestamp=as_utc(timestamp),
+                transaction_id=transaction_id,
+                debit_account=debit_account,
+                credit_account=credit_account,
+                amount=_money(amount),
+                symbol=symbol,
+            )
+        )
+
+    def update_market_price(self, symbol: str, mid: float) -> float:
+        normalized = symbol.strip().upper()
+        mark = _decimal(mid)
+        if mark <= 0:
+            raise ValueError(f"mid must be > 0, got {mid}")
+        self._marks[normalized] = mark
+        self.last_mid[normalized] = float(mark)
+
+        self._equity = self._recompute_equity()
+        self.assert_reconciled()
+        return float(self._equity)
+
+    def snapshot_equity(self, timestamp: dt.datetime | None = None) -> float:
+        equity = float(self._equity)
+        if timestamp is not None:
+            point = EquityPoint(timestamp=timestamp, equity=equity)
+            if self.equity_points and self.equity_points[-1].timestamp == point.timestamp:
+                self.equity_points[-1] = point
+                self.equity_curve[-1] = equity
+            else:
+                self.equity_points.append(point)
+                self.equity_curve.append(equity)
+        else:
+            self.equity_curve.append(equity)
         self.peak_equity = max(self.peak_equity, equity)
 
-        # max drawdown halt
         if self.peak_equity > 0:
-            dd = (self.peak_equity - equity) / self.peak_equity
-            if dd >= self.risk_cfg.max_drawdown_pct and not self.risk_state.trading_halted:
+            drawdown = (self.peak_equity - equity) / self.peak_equity
+            if drawdown >= self.risk_cfg.max_drawdown_pct and not self.risk_state.trading_halted:
                 self.risk_state.trading_halted = True
-                self.risk_state.halt_reason = f"Max drawdown reached: {dd:.2%}"
-
+                self.risk_state.halt_reason = f"Max drawdown reached: {drawdown:.2%}"
         return equity
+
+    def mark_to_market(
+        self,
+        symbol: str,
+        mid: float,
+        timestamp: dt.datetime | None = None,
+    ) -> float:
+        self.update_market_price(symbol, mid)
+        return self.snapshot_equity(timestamp)
 
     def equity(self) -> float:
         return float(self._equity)
 
-    def _recompute_equity(self) -> float:
-        total = self.cash
-        for sym, pos in self.positions.items():
-            mid = self.last_mid.get(sym)
-            if mid is None:
-                continue
-            total += pos.quantity * mid
-        return float(total)
+    def _recompute_equity(self) -> Decimal:
+        total = self._cash
+        for symbol, position in self.positions.items():
+            mark = self._marks.get(symbol)
+            if mark is not None:
+                total += position.quantity * mark
+        return _money(total)
+
+    def assert_reconciled(self) -> None:
+        expected = self._recompute_equity()
+        if expected != self._equity:
+            raise RuntimeError(
+                f"Portfolio does not reconcile: tracked={self._equity} expected={expected}"
+            )
 
     def check_stop_loss(self, symbol: str) -> Side | None:
-        pos = self.positions.get(symbol)
-        if pos is None or pos.quantity == 0:
+        position = self.positions.get(symbol)
+        if position is None or position.quantity == 0:
             return None
-        mid = self.last_mid.get(symbol)
-        if mid is None or pos.avg_cost == 0:
+        mid = self._marks.get(symbol)
+        if mid is None or position._avg_cost == 0:
             return None
 
-        # If long: stop if mid <= avg_cost*(1-stop_loss_pct)
-        # If short: stop if mid >= avg_cost*(1+stop_loss_pct)
-        if pos.quantity > 0 and mid <= pos.avg_cost * (1.0 - self.risk_cfg.stop_loss_pct):
+        stop = _decimal(self.risk_cfg.stop_loss_pct)
+        if position.quantity > 0 and mid <= position._avg_cost * (Decimal("1") - stop):
             return Side.SELL
-        if pos.quantity < 0 and mid >= pos.avg_cost * (1.0 + self.risk_cfg.stop_loss_pct):
+        if position.quantity < 0 and mid >= position._avg_cost * (Decimal("1") + stop):
             return Side.BUY
         return None

@@ -1,47 +1,104 @@
+name: quant-backtester
+
+x-app: &app
+  build:
+    context: ../..
+    dockerfile: infra/docker/Dockerfile
+    args:
+      SOURCE_REVISION: ${SOURCE_REVISION:-development}
+      BUILD_DATE: ${BUILD_DATE:-development}
+  image: quant-backtester:${IMAGE_TAG:-local}
+  init: true
+  user: "10001:10001"
+  read_only: true
+  tmpfs:
+    - /tmp:size=128m,mode=1777
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  restart: unless-stopped
+  environment: &app-environment
+    DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-quant}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-quantdb}
+    QBT_ENVIRONMENT: development
+    QBT_AUTH_MODE: ${QBT_AUTH_MODE:-api-key}
+    QBT_API_KEYS_JSON: ${QBT_API_KEYS_JSON:?Set QBT_API_KEYS_JSON}
+    QBT_DATA_ROOT: /app
+    QBT_ARTIFACT_ROOT: /app/runs
+    QBT_LOG_LEVEL: ${QBT_LOG_LEVEL:-INFO}
+  volumes:
+    - ../../data:/app/data:ro
+    - artifacts:/app/runs
+  networks:
+    - backend
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+  mem_limit: 1g
+  cpus: 1.0
+
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16.13-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:-quant}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-quantdb}
     volumes:
       - pgdata:/var/lib/postgresql/data
     networks:
       - backend
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-quant} -d ${POSTGRES_DB:-quantdb}"]
       interval: 5s
       timeout: 3s
       retries: 20
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
 
-  backtester:
-    build:
-      context: ../..
-      dockerfile: infra/docker/Dockerfile
+  migrate:
+    <<: *app
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+    restart: "no"
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: ${DATABASE_URL}
-    volumes:
-      - ../../data:/app/data:ro
-      - ../../runs:/app/runs
-    networks:
-      - backend
-    # Security hardening
-    user: "10001:10001"
-    read_only: true
-    tmpfs:
-      - /tmp
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
+      <<: *app-environment
+      QBT_AUTH_MODE: disabled
+      QBT_API_KEYS_JSON: "[]"
+
+  api:
+    <<: *app
+    command: ["quant-backtester-api", "--json-logs"]
+    ports:
+      - "127.0.0.1:${QBT_API_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  worker:
+    <<: *app
+    command: ["quant-backtester-worker", "--json-logs"]
+    deploy:
+      replicas: ${QBT_WORKER_REPLICAS:-1}
+    healthcheck:
+      disable: true
 
 volumes:
   pgdata:
+  artifacts:
 
 networks:
   backend:
     driver: bridge
+    internal: true

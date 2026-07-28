@@ -1,4 +1,4 @@
-# Event-Driven Backtesting Platform Prototype
+# Quant Backtester
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://github.com/libport/backtest/blob/main/pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/libport/backtest/blob/main/LICENSE)
@@ -7,27 +7,38 @@
 [![Tests: pytest](https://img.shields.io/badge/tests-pytest-0A9EDC?logo=pytest&logoColor=white)](https://github.com/libport/backtest/tree/main/tests)
 [![Last Commit](https://img.shields.io/github/last-commit/libport/backtest)](https://github.com/libport/backtest/commits/main)
 
-An event-driven Python backtesting prototype with reproducible runs, parameter sweeps, walk-forward evaluation, execution slippage, risk controls, and optional persistence to SQLite or PostgreSQL.
+A deterministic, event-driven research platform with a local CLI and a production control
+plane. It supports reproducible backtests, parameter sweeps, walk-forward evaluation,
+durable multi-tenant jobs, immutable dataset registration, and detailed PostgreSQL or SQLite
+persistence.
 
 ## What it includes
 
 - Event-driven backtest loop over CSV market data
 - Multi-asset moving-average crossover strategy
-- Simulated execution with spread, impact, latency, queueing, and partial fills
-- Portfolio risk controls for max position, stop-loss, and max drawdown halt
-- Persistence via SQLAlchemy with Alembic migrations
-- Parameter sweeps and walk-forward optimization
-- Structured logging, benchmark script, and CSV export utilities
-- Local Docker Compose Postgres stack plus a Terraform AWS RDS template
+- Validated UTC-normalized input with bounded-memory streaming and duplicate policy
+- Simulated execution with market, limit, stop, and stop-limit orders; latency, queueing,
+  participation limits, partial fills, price protection, and reduce-only liquidation
+- Fixed-precision, replay-safe portfolio accounting with a balanced execution journal
+- Position, gross-exposure, leverage, stop-loss, and drawdown risk controls
+- Reproducible result hashes and manifests containing source, data, config, and engine provenance
+- SQLAlchemy persistence with Alembic migrations for runs, orders, fills, equity, jobs,
+  datasets, artifacts, and audit events
+- FastAPI control plane, API-key or OIDC authentication, durable leased workers, and optional
+  SQS/S3 integration
+- Structured logs, Prometheus metrics, OpenTelemetry traces, benchmark/export utilities, and CI
+- Hardened Docker Compose development stack and a complete Terraform AWS deployment
 
 ## Repository layout
 
 - `src/quant_backtester/`: core package
-- `tests/`: smoke, config, execution, sweep, and walk-forward coverage
+- `src/quant_backtester/service/`: API, authentication, job queue, dataset registry, and worker
+- `tests/`: unit, regression, property, service lifecycle, and smoke coverage
 - `scripts/benchmark_backtest.py`: synthetic performance check
 - `scripts/export_runs.py`: exports persisted runs to CSV
-- `infra/docker/`: local Postgres container setup
-- `infra/terraform/aws/`: conservative AWS RDS template
+- `infra/docker/`: local API, worker, migration, and PostgreSQL stack
+- `infra/terraform/aws/`: AWS VPC, ALB/WAF, ECS, RDS, S3, SQS, KMS, IAM, and monitoring
+- `requirements/`: pinned production image and build dependency sets
 - `data/sample_prices.csv`: sample input data
 
 ## Quickstart
@@ -36,7 +47,7 @@ An event-driven Python backtesting prototype with reproducible runs, parameter s
 python -m venv .venv
 source .venv/bin/activate
 pip install -U pip
-pip install -e ".[dev]"
+pip install -e ".[dev,postgres,service]"
 pytest
 python -m quant_backtester.cli run --csv data/sample_prices.csv --symbols AAPL,MSFT
 python -m quant_backtester.cli sweep --csv data/sample_prices.csv --symbols AAPL,MSFT
@@ -134,6 +145,50 @@ Optional columns:
 
 See `data/sample_prices.csv` for the expected shape.
 
+## Execution and valuation semantics
+
+- Each market event updates the current mark, processes eligible fills, and then records one
+  post-fill equity point. Final equity is read from the live portfolio state, so a fill on the
+  final data event is included in final equity and derived metrics.
+- LIMIT prices are hard execution boundaries after spread and impact: BUY fills cannot exceed
+  their limit and SELL fills cannot fall below it. Fill quantity is reduced when modeled impact
+  exhausts the price headroom, and the remainder stays pending.
+- Stop-loss liquidations have a single active order per symbol. They remain active through
+  latency, price rebounds, and partial fills; conflicting pending strategy orders are cancelled,
+  and reduce-only enforcement prevents a liquidation from reversing the position.
+- Orders still pending when market data ends are not synthetically filled. The result's `extra`
+  payload reports `pending_order_count` and `active_stop_symbols`.
+
+## API and worker
+
+Install the `service` extra to expose these entry points:
+
+- `quant-backtester-api`: FastAPI control plane and browser console
+- `quant-backtester-worker`: leased, retryable job runner
+- `quant-backtester-db-bootstrap`: creates or rotates the least-privilege PostgreSQL runtime role
+
+The API provides:
+
+- `POST /v1/datasets` and `GET /v1/datasets`: immutable dataset registration
+- `POST /v1/jobs`, `GET /v1/jobs`, and `POST /v1/jobs/{id}/cancel`: idempotent job lifecycle
+- `GET /v1/runs`: tenant-scoped persisted results
+- `/health/live`, `/health/ready`, `/metrics`, `/docs`, and a small console at `/`
+
+Every job submission requires an `Idempotency-Key`. PostgreSQL is the durable job authority;
+SQS is an optional at-least-once wake-up channel. Workers use renewable leases, bounded retries,
+cancellation checks, and the job ID as the run ID so replay after a crash remains idempotent.
+
+Authentication modes are `api-key`, `oidc`, and `disabled`. Disabled authentication is rejected
+in production. API keys are configured as SHA-256 digests, never plaintext:
+
+```bash
+python -c "import hashlib; print(hashlib.sha256(b'REPLACE_TOKEN').hexdigest())"
+```
+
+Production mode also requires registered datasets. Dataset S3 URIs must stay within the
+configured bucket/prefix and include an immutable `versionId`; workers verify the registered
+SHA-256 digest before executing.
+
 ## Persistence
 
 SQLite works out of the box. PostgreSQL support is available through the optional extra:
@@ -146,37 +201,43 @@ alembic upgrade head
 To export persisted runs:
 
 ```bash
-DATABASE_URL=sqlite:///runs/runs.db python scripts/export_runs.py
+DATABASE_URL=sqlite:///runs/runs.db python scripts/export_runs.py --tenant-id default
 ```
 
 ## Docker Compose
 
-The Docker setup runs the backtester against PostgreSQL using the settings in `.env.example`.
+The Compose stack runs a one-shot migration followed by the API and worker against PostgreSQL.
+Replace every placeholder in `.env` before starting it.
 
 ```bash
 cp .env.example .env
-docker compose -f infra/docker/docker-compose.yml up --build -d postgres
-docker compose -f infra/docker/docker-compose.yml run --rm backtester run --csv /app/data/sample_prices.csv --symbols AAPL,MSFT
+docker compose -f infra/docker/docker-compose.yml up --build -d
+curl http://127.0.0.1:8000/health/ready
 ```
 
-Current hardening in `infra/docker/docker-compose.yml` includes:
+The API binds only to `127.0.0.1` by default. Data is mounted read-only, while PostgreSQL and
+result artifacts use named volumes. Application containers run with:
 
-- non-root container user
-- read-only root filesystem
-- `tmpfs` for `/tmp`
-- dropped Linux capabilities
-- `no-new-privileges`
+- a non-root UID/GID
+- a read-only root filesystem and bounded `/tmp` tmpfs
+- all Linux capabilities dropped
+- `no-new-privileges`, resource limits, and an internal backend network
+- pinned base and PostgreSQL image digests
 
-## Terraform AWS template
+## Terraform AWS deployment
 
-`infra/terraform/aws/` provisions a conservative PostgreSQL foundation:
+`infra/terraform/aws/` defines a production foundation with:
 
-- VPC with public and private subnets
-- RDS PostgreSQL in private subnets
-- security group restricted by `allowed_cidr`
-- master password stored in AWS Secrets Manager
+- a two-AZ VPC, public ALB, private ECS/Fargate tasks, WAF, and TLS-only ingress
+- encrypted Multi-AZ RDS PostgreSQL with managed master credentials
+- separate application database credentials and a least-privilege bootstrap task
+- versioned, encrypted artifact storage and object-locked dataset storage
+- encrypted SQS/DLQ job wake-ups, immutable ECR, least-privilege IAM, and KMS
+- autoscaling, CloudWatch logs, alarms, dashboard, and optional OTLP export
 
-It is a template, not a one-command production deployment. Review variables and networking before use.
+The image reference must be pinned by digest. An ACM certificate and a separately managed
+Secrets Manager value for the application database role are required. See
+`infra/terraform/aws/README.md` for the bootstrap/migration sequence and operational cautions.
 
 ## Development
 
@@ -184,15 +245,17 @@ Common local commands:
 
 ```bash
 make install
-make lint
-make type
-make test
+make check
+make test-cov
 make smoke
+make migration-check
+make package
 ```
 
 The repository also includes `.pre-commit-config.yaml` hooks for Ruff, mypy, and pytest.
-
-GitHub Actions are intentionally not configured here, so validation is expected to run locally or in your preferred CI system.
+GitHub Actions runs Python 3.11/3.13 quality checks, a PostgreSQL migration round trip, packaging,
+dependency auditing, Terraform and Compose validation, a hardened container smoke test,
+Trivy scanning, and CycloneDX SBOM generation.
 
 ## Next upgrades
 

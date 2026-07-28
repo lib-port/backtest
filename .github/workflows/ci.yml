@@ -1,0 +1,206 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONHASHSEED: "0"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  quality:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install -e ".[dev,postgres,service]"
+      - run: python -m pip check
+      - run: python -m ruff format --check .
+      - run: python -m ruff check .
+      - run: python -m mypy
+      - run: python -m pytest --cov=quant_backtester --cov-report=term-missing --cov-report=xml
+        env:
+          HYPOTHESIS_STORAGE_DIRECTORY: /tmp/quant-backtester-hypothesis
+
+  migrations:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16.13-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50
+        env:
+          POSTGRES_USER: quant
+          POSTGRES_PASSWORD: test-only
+          POSTGRES_DB: quantdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U quant -d quantdb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install --requirement requirements/runtime.lock
+      - run: python -m pip install --no-deps -e .
+      - run: python -m alembic upgrade head
+        env:
+          DATABASE_URL: postgresql+psycopg://quant:test-only@localhost:5432/quantdb
+      - run: python -m alembic check
+        env:
+          DATABASE_URL: postgresql+psycopg://quant:test-only@localhost:5432/quantdb
+      - run: python -m alembic downgrade base
+        env:
+          DATABASE_URL: postgresql+psycopg://quant:test-only@localhost:5432/quantdb
+      - run: python -m alembic upgrade head
+        env:
+          DATABASE_URL: postgresql+psycopg://quant:test-only@localhost:5432/quantdb
+      - run: python -m alembic check
+        env:
+          DATABASE_URL: postgresql+psycopg://quant:test-only@localhost:5432/quantdb
+
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --requirement requirements/build.lock
+      - run: python -m build
+      - run: python -m pip install dist/*.whl
+      - run: quant-backtester --help
+      - run: unzip -l dist/*.whl | grep -F quant_backtester/py.typed
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - run: python -m pip install "pip-audit==2.10.1"
+      - run: python -m pip_audit --requirement requirements/service.lock --progress-spinner=off
+
+  infrastructure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: mkdir -p "$RUNNER_TEMP/terraform"
+      - name: Terraform format
+        run: >-
+          docker run --rm
+          -v "$PWD/infra/terraform/aws:/workspace"
+          -w /workspace
+          hashicorp/terraform:1.10.5@sha256:679ac5e095bf550bc726742cd12efa6050f0913080df479fdabfeb202953af28
+          fmt -check -diff
+      - name: Terraform initialize
+        run: >-
+          docker run --rm
+          -e TF_DATA_DIR=/terraform-data
+          -v "$RUNNER_TEMP/terraform:/terraform-data"
+          -v "$PWD/infra/terraform/aws:/workspace"
+          -w /workspace
+          hashicorp/terraform:1.10.5@sha256:679ac5e095bf550bc726742cd12efa6050f0913080df479fdabfeb202953af28
+          init -backend=false -lockfile=readonly
+      - name: Terraform validate
+        run: >-
+          docker run --rm
+          -e TF_DATA_DIR=/terraform-data
+          -v "$RUNNER_TEMP/terraform:/terraform-data"
+          -v "$PWD/infra/terraform/aws:/workspace"
+          -w /workspace
+          hashicorp/terraform:1.10.5@sha256:679ac5e095bf550bc726742cd12efa6050f0913080df479fdabfeb202953af28
+          validate
+      - name: Compose configuration
+        run: docker compose --env-file .env.ci -f infra/docker/docker-compose.yml config --quiet
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+          QBT_API_KEYS_JSON: '[{"token_sha256":"d1ab2873918d9bd28b4d70174ca92a3a456b2a0eef335acbf3234b9c4680e4a7","actor_id":"ci","tenant_id":"default","role":"admin"}]'
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Build production image
+        run: >-
+          docker build
+          --file infra/docker/Dockerfile
+          --build-arg SOURCE_REVISION="$GITHUB_SHA"
+          --tag quant-backtester:ci
+          .
+      - name: Runtime smoke test
+        run: |
+          docker run --detach --name quant-backtester-ci \
+            --read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m,mode=1777 \
+            --tmpfs /app/runs:rw,noexec,nosuid,size=128m,mode=1777 \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --env QBT_ENVIRONMENT=test --env QBT_AUTH_MODE=disabled \
+            --publish 127.0.0.1:8000:8000 quant-backtester:ci
+          trap 'docker rm --force quant-backtester-ci' EXIT
+          for attempt in $(seq 1 30); do
+            curl --fail --silent http://127.0.0.1:8000/health/ready && break
+            if [ "$attempt" = 30 ]; then
+              docker logs quant-backtester-ci
+              exit 1
+            fi
+            sleep 1
+          done
+          docker exec quant-backtester-ci quant-backtester --help >/dev/null
+      - name: Vulnerability scan
+        run: >-
+          docker run --rm
+          -v /var/run/docker.sock:/var/run/docker.sock
+          aquasec/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e
+          image --exit-code 1 --ignore-unfixed --severity HIGH,CRITICAL quant-backtester:ci
+      - name: Generate CycloneDX SBOM
+        run: |
+          mkdir -p artifacts
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD/artifacts:/output" \
+            aquasec/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e \
+            image --format cyclonedx --output /output/quant-backtester.cdx.json \
+            quant-backtester:ci
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quant-backtester-sbom
+          path: artifacts/quant-backtester.cdx.json
+          if-no-files-found: error

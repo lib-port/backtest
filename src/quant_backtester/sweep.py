@@ -2,22 +2,80 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import replace
+from datetime import date
 from itertools import product
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from typing import cast
 
 import pandas as pd
 
 from quant_backtester.backtest import run_backtest, run_to_model
 from quant_backtester.config import BacktestConfig
+from quant_backtester.data.csv_data_handler import CSVDataHandler, InMemoryDataHandler
+from quant_backtester.events import MarketEvent
 from quant_backtester.persistence.db import Database
+from quant_backtester.persistence.models import Run
+from quant_backtester.results import result_hash_from_mapping
 
 logger = logging.getLogger(__name__)
 
+RESULT_COLUMNS = [
+    "run_id",
+    "run_name",
+    "symbols",
+    "short_window",
+    "long_window",
+    "initial_cash",
+    "final_equity",
+    "total_return",
+    "sharpe",
+    "max_drawdown",
+    "total_commission",
+    "total_slippage_cost",
+    "realized_pnl",
+    "halted",
+    "halt_reason",
+    "created_at",
+    "completed_at",
+    "result_hash",
+    "extra",
+]
 
-def _valid_param_pairs(short_windows: list[int], long_windows: list[int]) -> list[tuple[int, int]]:
-    return [(sw, lw) for sw, lw in product(short_windows, long_windows) if sw < lw]
+
+def _number(result: dict[str, object], key: str) -> float:
+    value = result[key]
+    if isinstance(value, (int, float, str)):
+        return float(value)
+    raise TypeError(f"Result field {key!r} is not numeric")
+
+
+def _integer(result: dict[str, object], key: str) -> int:
+    return int(_number(result, key))
+
+
+def _valid_param_pairs(
+    short_windows: Iterable[int],
+    long_windows: Iterable[int],
+) -> list[tuple[int, int]]:
+    return sorted(
+        {
+            (short_window, long_window)
+            for short_window, long_window in product(short_windows, long_windows)
+            if short_window > 0 and short_window < long_window
+        }
+    )
+
+
+def _load_events(cfg: BacktestConfig) -> tuple[MarketEvent, ...]:
+    return tuple(CSVDataHandler(cfg.csv_path, cfg.data).stream())
+
+
+def _persist_models(database: Database | None, pending: list[Run]) -> None:
+    if database is not None and pending:
+        database.insert_runs_bulk(pending)
+    pending.clear()
 
 
 def run_parameter_sweep(
@@ -25,41 +83,56 @@ def run_parameter_sweep(
     short_windows: list[int],
     long_windows: list[int],
     export_csv: str | None = None,
+    *,
+    persist: bool = True,
 ) -> pd.DataFrame:
-    if export_csv is None:
-        export_csv = str(Path(cfg.out_dir) / "sweep_results.csv")
+    destination = Path(export_csv or (Path(cfg.out_dir) / "sweep_results.csv"))
+    valid_pairs = _valid_param_pairs(short_windows, long_windows)
+    events = _load_events(cfg)
+    source = InMemoryDataHandler(events)
+    database = Database(cfg.database_url) if persist else None
+    if database is not None:
+        database.prepare_schema()
 
     logger.info(
         "Sweep started",
         extra={
             "event": {
                 "run_name": cfg.run_name,
-                "short_grid_size": len(short_windows),
-                "long_grid_size": len(long_windows),
+                "parameter_count": len(valid_pairs),
+                "persist": persist,
             }
         },
     )
     results: list[dict[str, object]] = []
-    valid_pairs = _valid_param_pairs(short_windows, long_windows)
-    db = Database(cfg.database_url)
-    db.create_tables()
-    pending_models = []
-    insert_chunk_size = 500
-    for sw, lw in valid_pairs:
+    pending_models: list[Run] = []
+    for short_window, long_window in valid_pairs:
         run_cfg = replace(
-            cfg, short_window=sw, long_window=lw, run_name=f"{cfg.run_name}-sw{sw}-lw{lw}"
+            cfg,
+            short_window=short_window,
+            long_window=long_window,
+            run_name=f"{cfg.run_name}-sw{short_window}-lw{long_window}",
         )
-        run_result = run_backtest(run_cfg, persist=False)
-        results.append(run_result)
-        pending_models.append(run_to_model(run_result))
-        if len(pending_models) >= insert_chunk_size:
-            db.insert_runs_bulk(pending_models)
-            pending_models.clear()
+        result = run_backtest(
+            run_cfg,
+            persist=False,
+            data_source=source,
+            write_artifact=False,
+        )
+        results.append(result)
+        if database is not None:
+            pending_models.append(run_to_model(result))
+            if len(pending_models) >= 500:
+                _persist_models(database, pending_models)
+    _persist_models(database, pending_models)
 
-    if pending_models:
-        db.insert_runs_bulk(pending_models)
-
-    if not results:
+    if results:
+        frame = pd.DataFrame(results).sort_values(
+            ["total_return", "sharpe"],
+            ascending=False,
+        )
+    else:
+        frame = pd.DataFrame(columns=RESULT_COLUMNS)
         logger.warning(
             "Sweep has no valid parameter pairs",
             extra={
@@ -70,38 +143,13 @@ def run_parameter_sweep(
                 }
             },
         )
-        df = pd.DataFrame(
-            columns=[
-                "run_name",
-                "symbols",
-                "short_window",
-                "long_window",
-                "initial_cash",
-                "final_equity",
-                "total_return",
-                "sharpe",
-                "max_drawdown",
-                "total_commission",
-                "total_slippage_cost",
-                "halted",
-                "halt_reason",
-                "created_at",
-                "extra",
-            ]
-        )
-        Path(export_csv).parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(export_csv, index=False)
-        return df
-
-    df = pd.DataFrame(results)
-    df = df.sort_values(["total_return", "sharpe"], ascending=False)
-    Path(export_csv).parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(export_csv, index=False)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(destination, index=False)
     logger.info(
         "Sweep completed",
-        extra={"event": {"run_count": len(results), "export_csv": export_csv}},
+        extra={"event": {"run_count": len(results), "export_csv": str(destination)}},
     )
-    return df
+    return frame
 
 
 def run_walk_forward(
@@ -112,164 +160,232 @@ def run_walk_forward(
     test_days: int,
     step_days: int,
     export_csv: str | None = None,
+    *,
+    purge_days: int = 0,
+    embargo_days: int = 0,
+    warmup_days: int | None = None,
+    allow_test_overlap: bool = False,
+    persist: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
-    if train_days <= 0:
-        raise ValueError("train_days must be > 0")
-    if test_days <= 0:
-        raise ValueError("test_days must be > 0")
-    if step_days <= 0:
-        raise ValueError("step_days must be > 0")
-
+    _validate_walk_forward(
+        train_days=train_days,
+        test_days=test_days,
+        step_days=step_days,
+        purge_days=purge_days,
+        embargo_days=embargo_days,
+        warmup_days=warmup_days,
+        allow_test_overlap=allow_test_overlap,
+    )
     valid_pairs = _valid_param_pairs(short_windows, long_windows)
     if not valid_pairs:
-        raise ValueError("No valid parameter pairs: require short_window < long_window")
+        raise ValueError("No valid parameter pairs: require 0 < short_window < long_window")
 
-    if export_csv is None:
-        export_csv = str(Path(cfg.out_dir) / "walk_forward_results.csv")
+    destination = Path(export_csv or (Path(cfg.out_dir) / "walk_forward_results.csv"))
+    events = _load_events(cfg)
+    events_by_date: dict[date, list[MarketEvent]] = {}
+    for event in events:
+        events_by_date.setdefault(event.timestamp.date(), []).append(event)
+    unique_dates = sorted(events_by_date)
+    resolved_warmup_days = (
+        max(long_window for _, long_window in valid_pairs) if warmup_days is None else warmup_days
+    )
 
-    market_df = pd.read_csv(cfg.csv_path)
-    if "date" not in market_df.columns:
-        raise ValueError("CSV missing required column: date")
-    market_df["date"] = pd.to_datetime(market_df["date"], utc=False, errors="coerce")
-    if market_df["date"].isna().any():
-        raise ValueError("CSV contains invalid date values")
-    market_df = market_df.sort_values("date")
-
-    unique_dates = sorted(market_df["date"].drop_duplicates().tolist())
-    total_days = len(unique_dates)
+    database = Database(cfg.database_url) if persist else None
+    if database is not None:
+        database.prepare_schema()
 
     logger.info(
         "Walk-forward started",
         extra={
             "event": {
                 "run_name": cfg.run_name,
-                "short_grid_size": len(short_windows),
-                "long_grid_size": len(long_windows),
+                "parameter_count": len(valid_pairs),
                 "train_days": train_days,
                 "test_days": test_days,
                 "step_days": step_days,
-                "total_days": total_days,
+                "purge_days": purge_days,
+                "embargo_days": embargo_days,
+                "warmup_days": resolved_warmup_days,
+                "total_days": len(unique_dates),
+                "persist": persist,
             }
         },
     )
 
     rows: list[dict[str, object]] = []
-    db = Database(cfg.database_url)
-    db.create_tables()
-    pending_models = []
-    insert_chunk_size = 200
+    pending_models: list[Run] = []
+    cursor = 0
+    window_index = 1
+    required_days = train_days + purge_days + test_days
 
-    with TemporaryDirectory(prefix="walk_forward_", dir=cfg.out_dir) as tmp_dir:
-        cursor = 0
-        window_idx = 1
-        while cursor + train_days + test_days <= total_days:
-            train_dates = unique_dates[cursor : cursor + train_days]
-            test_dates = unique_dates[cursor + train_days : cursor + train_days + test_days]
-            cursor += step_days
+    while cursor + required_days <= len(unique_dates):
+        train_dates = unique_dates[cursor : cursor + train_days]
+        test_start = cursor + train_days + purge_days
+        test_dates = unique_dates[test_start : test_start + test_days]
+        train_events = _events_for_dates(events_by_date, train_dates)
+        test_events = _events_for_dates(events_by_date, test_dates)
+        if not train_events or not test_events:
+            cursor += step_days + embargo_days
+            window_index += 1
+            continue
 
-            train_df = market_df[market_df["date"].isin(train_dates)]
-            test_df = market_df[market_df["date"].isin(test_dates)]
-            if train_df.empty or test_df.empty:
-                window_idx += 1
-                continue
-
-            train_csv = Path(tmp_dir) / f"train_window_{window_idx}.csv"
-            test_csv = Path(tmp_dir) / f"test_window_{window_idx}.csv"
-            train_df.to_csv(train_csv, index=False)
-            test_df.to_csv(test_csv, index=False)
-
-            best_train_result: dict[str, object] | None = None
-            best_pair: tuple[int, int] | None = None
-
-            for sw, lw in valid_pairs:
-                train_cfg = replace(
-                    cfg,
-                    csv_path=str(train_csv),
-                    short_window=sw,
-                    long_window=lw,
-                    run_name=f"{cfg.run_name}-wf{window_idx}-train-sw{sw}-lw{lw}",
-                )
-                train_result = run_backtest(train_cfg, persist=False)
-                train_score = (
-                    float(train_result["total_return"]),
-                    float(train_result["sharpe"]),
-                    -float(train_result["max_drawdown"]),
-                )
-                if best_train_result is None:
-                    best_train_result = train_result
-                    best_pair = (sw, lw)
-                    continue
-                current_best_score = (
-                    float(best_train_result["total_return"]),
-                    float(best_train_result["sharpe"]),
-                    -float(best_train_result["max_drawdown"]),
-                )
-                if train_score > current_best_score:
-                    best_train_result = train_result
-                    best_pair = (sw, lw)
-
-            assert best_train_result is not None
-            assert best_pair is not None
-
-            test_cfg = replace(
+        best_result: dict[str, object] | None = None
+        best_pair: tuple[int, int] | None = None
+        for short_window, long_window in valid_pairs:
+            train_cfg = replace(
                 cfg,
-                csv_path=str(test_csv),
-                short_window=best_pair[0],
-                long_window=best_pair[1],
-                run_name=f"{cfg.run_name}-wf{window_idx}-oos-sw{best_pair[0]}-lw{best_pair[1]}",
+                short_window=short_window,
+                long_window=long_window,
+                run_name=(
+                    f"{cfg.run_name}-wf{window_index}-train-sw{short_window}-lw{long_window}"
+                ),
             )
-            oos_result = run_backtest(test_cfg, persist=False)
-            oos_extra = dict(oos_result["extra"]) if isinstance(oos_result.get("extra"), dict) else {}
-            oos_extra["walk_forward"] = {
-                "window_index": window_idx,
+            candidate = run_backtest(
+                train_cfg,
+                persist=False,
+                data_source=InMemoryDataHandler(train_events),
+                write_artifact=False,
+            )
+            if best_result is None or _score(candidate) > _score(best_result):
+                best_result = candidate
+                best_pair = (short_window, long_window)
+
+        assert best_result is not None
+        assert best_pair is not None
+        warmup_start = max(0, test_start - resolved_warmup_days)
+        warmup_dates_view = unique_dates[warmup_start:test_start]
+        warmup_events_view = _events_for_dates(events_by_date, warmup_dates_view)
+        test_cfg = replace(
+            cfg,
+            short_window=best_pair[0],
+            long_window=best_pair[1],
+            run_name=(f"{cfg.run_name}-wf{window_index}-oos-sw{best_pair[0]}-lw{best_pair[1]}"),
+        )
+        out_of_sample = run_backtest(
+            test_cfg,
+            persist=False,
+            data_source=InMemoryDataHandler(test_events),
+            warmup_events=warmup_events_view,
+            write_artifact=False,
+        )
+        raw_extra = out_of_sample.get("extra")
+        out_of_sample_extra = dict(raw_extra) if isinstance(raw_extra, dict) else {}
+        out_of_sample_extra["walk_forward"] = {
+            "window_index": window_index,
+            "train_start": train_dates[0].isoformat(),
+            "train_end": train_dates[-1].isoformat(),
+            "test_start": test_dates[0].isoformat(),
+            "test_end": test_dates[-1].isoformat(),
+            "purge_days": purge_days,
+            "embargo_days": embargo_days,
+            "warmup_days": resolved_warmup_days,
+            "best_short_window": best_pair[0],
+            "best_long_window": best_pair[1],
+            "in_sample_total_return": _number(best_result, "total_return"),
+            "in_sample_sharpe": _number(best_result, "sharpe"),
+            "in_sample_max_drawdown": _number(best_result, "max_drawdown"),
+        }
+        out_of_sample["extra"] = out_of_sample_extra
+        out_of_sample["result_hash"] = result_hash_from_mapping(out_of_sample)
+
+        if database is not None:
+            pending_models.append(run_to_model(out_of_sample))
+            if len(pending_models) >= 200:
+                _persist_models(database, pending_models)
+
+        rows.append(
+            {
+                "window_index": window_index,
                 "train_start": train_dates[0].isoformat(),
                 "train_end": train_dates[-1].isoformat(),
                 "test_start": test_dates[0].isoformat(),
                 "test_end": test_dates[-1].isoformat(),
                 "best_short_window": best_pair[0],
                 "best_long_window": best_pair[1],
-                "in_sample_total_return": float(best_train_result["total_return"]),
-                "in_sample_sharpe": float(best_train_result["sharpe"]),
-                "in_sample_max_drawdown": float(best_train_result["max_drawdown"]),
+                "train_total_return": _number(best_result, "total_return"),
+                "train_sharpe": _number(best_result, "sharpe"),
+                "train_max_drawdown": _number(best_result, "max_drawdown"),
+                "oos_total_return": _number(out_of_sample, "total_return"),
+                "oos_sharpe": _number(out_of_sample, "sharpe"),
+                "oos_max_drawdown": _number(out_of_sample, "max_drawdown"),
+                "oos_halted": bool(out_of_sample["halted"]),
+                "oos_halt_reason": out_of_sample["halt_reason"],
+                "oos_run_name": str(out_of_sample["run_name"]),
+                "oos_run_id": str(out_of_sample["run_id"]),
+                "oos_result_hash": str(out_of_sample["result_hash"]),
             }
-            oos_result["extra"] = oos_extra
+        )
+        cursor += step_days + embargo_days
+        window_index += 1
 
-            pending_models.append(run_to_model(oos_result))
-            if len(pending_models) >= insert_chunk_size:
-                db.insert_runs_bulk(pending_models)
-                pending_models.clear()
+    _persist_models(database, pending_models)
+    frame = pd.DataFrame(rows).sort_values("window_index") if rows else pd.DataFrame()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(destination, index=False)
+    summary = _walk_forward_summary(frame, rows)
+    logger.info(
+        "Walk-forward completed",
+        extra={
+            "event": {
+                "run_name": cfg.run_name,
+                "window_count": len(frame),
+                "stability_score": summary["stability_score"],
+                "export_csv": str(destination),
+            }
+        },
+    )
+    return frame, summary
 
-            rows.append(
-                {
-                    "window_index": window_idx,
-                    "train_start": train_dates[0].date().isoformat(),
-                    "train_end": train_dates[-1].date().isoformat(),
-                    "test_start": test_dates[0].date().isoformat(),
-                    "test_end": test_dates[-1].date().isoformat(),
-                    "best_short_window": best_pair[0],
-                    "best_long_window": best_pair[1],
-                    "train_total_return": float(best_train_result["total_return"]),
-                    "train_sharpe": float(best_train_result["sharpe"]),
-                    "train_max_drawdown": float(best_train_result["max_drawdown"]),
-                    "oos_total_return": float(oos_result["total_return"]),
-                    "oos_sharpe": float(oos_result["sharpe"]),
-                    "oos_max_drawdown": float(oos_result["max_drawdown"]),
-                    "oos_halted": bool(oos_result["halted"]),
-                    "oos_halt_reason": oos_result["halt_reason"],
-                    "oos_run_name": oos_result["run_name"],
-                }
-            )
-            window_idx += 1
 
-    if pending_models:
-        db.insert_runs_bulk(pending_models)
+def _events_for_dates(
+    events_by_date: dict[date, list[MarketEvent]],
+    dates: Iterable[date],
+) -> tuple[MarketEvent, ...]:
+    return tuple(event for day in dates for event in events_by_date.get(day, ()))
 
-    df = pd.DataFrame(rows).sort_values("window_index") if rows else pd.DataFrame()
-    Path(export_csv).parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(export_csv, index=False)
 
-    if df.empty:
-        summary: dict[str, object] = {
+def _score(result: dict[str, object]) -> tuple[float, float, float]:
+    return (
+        _number(result, "total_return"),
+        _number(result, "sharpe"),
+        -_number(result, "max_drawdown"),
+    )
+
+
+def _validate_walk_forward(
+    *,
+    train_days: int,
+    test_days: int,
+    step_days: int,
+    purge_days: int,
+    embargo_days: int,
+    warmup_days: int | None,
+    allow_test_overlap: bool,
+) -> None:
+    for name, value in (
+        ("train_days", train_days),
+        ("test_days", test_days),
+        ("step_days", step_days),
+    ):
+        if value <= 0:
+            raise ValueError(f"{name} must be > 0")
+    for name, value in (("purge_days", purge_days), ("embargo_days", embargo_days)):
+        if value < 0:
+            raise ValueError(f"{name} must be >= 0")
+    if warmup_days is not None and warmup_days < 0:
+        raise ValueError("warmup_days must be >= 0")
+    if not allow_test_overlap and step_days < test_days:
+        raise ValueError(
+            "step_days must be >= test_days unless allow_test_overlap is explicitly enabled"
+        )
+
+
+def _walk_forward_summary(
+    frame: pd.DataFrame,
+    rows: list[dict[str, object]],
+) -> dict[str, object]:
+    if frame.empty:
+        return {
             "window_count": 0,
             "stability_score": 0.0,
             "most_common_short_window": None,
@@ -279,41 +395,25 @@ def run_walk_forward(
             "oos_mean_sharpe": 0.0,
             "oos_max_drawdown": 0.0,
         }
-        logger.warning(
-            "Walk-forward produced no windows",
-            extra={"event": {"run_name": cfg.run_name, "export_csv": export_csv}},
-        )
-        return df, summary
 
     pair_counter = Counter(
-        (int(row["best_short_window"]), int(row["best_long_window"])) for row in rows
+        (
+            cast(int, row["best_short_window"]),
+            cast(int, row["best_long_window"]),
+        )
+        for row in rows
     )
-    (common_sw, common_lw), common_count = pair_counter.most_common(1)[0]
-
-    oos_returns = df["oos_total_return"].astype(float)
-    oos_sharpes = df["oos_sharpe"].astype(float)
-    oos_drawdowns = df["oos_max_drawdown"].astype(float)
-
-    summary = {
-        "window_count": int(len(df)),
-        "stability_score": float(common_count / len(df)),
-        "most_common_short_window": int(common_sw),
-        "most_common_long_window": int(common_lw),
-        "oos_compounded_return": float((1.0 + oos_returns).prod() - 1.0),
-        "oos_mean_return": float(oos_returns.mean()),
-        "oos_mean_sharpe": float(oos_sharpes.mean()),
-        "oos_max_drawdown": float(oos_drawdowns.max()),
+    (common_short, common_long), common_count = pair_counter.most_common(1)[0]
+    returns = frame["oos_total_return"].astype(float)
+    sharpes = frame["oos_sharpe"].astype(float)
+    drawdowns = frame["oos_max_drawdown"].astype(float)
+    return {
+        "window_count": int(len(frame)),
+        "stability_score": float(common_count / len(frame)),
+        "most_common_short_window": common_short,
+        "most_common_long_window": common_long,
+        "oos_compounded_return": float((1.0 + returns).prod() - 1.0),
+        "oos_mean_return": float(returns.mean()),
+        "oos_mean_sharpe": float(sharpes.mean()),
+        "oos_max_drawdown": float(drawdowns.max()),
     }
-
-    logger.info(
-        "Walk-forward completed",
-        extra={
-            "event": {
-                "run_name": cfg.run_name,
-                "window_count": len(df),
-                "stability_score": summary["stability_score"],
-                "export_csv": export_csv,
-            }
-        },
-    )
-    return df, summary

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import os
 from logging.config import fileConfig
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from quant_backtester.config import database_url_from_env
 from quant_backtester.persistence.models import Base
 
 config = context.config
@@ -17,7 +17,7 @@ target_metadata = Base.metadata
 
 
 def get_url() -> str:
-    return os.getenv("DATABASE_URL", config.get_main_option("sqlalchemy.url"))
+    return database_url_from_env(config.get_main_option("sqlalchemy.url"))
 
 
 def run_migrations_offline() -> None:

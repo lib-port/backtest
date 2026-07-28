@@ -45,6 +45,10 @@ def main() -> None:
     ap.add_argument("--rng-seed", type=int, default=7)
     args = ap.parse_args()
     configure_logging(level="INFO", json_logs=bool(os.getenv("CI")))
+    if args.ticks <= 0 or args.repeats <= 0:
+        raise SystemExit("--ticks and --repeats must be > 0")
+    if args.max_seconds is not None and args.max_seconds <= 0:
+        raise SystemExit("--max-seconds must be > 0")
 
     symbols = tuple(s.strip().upper() for s in args.symbols.split(",") if s.strip())
     if not symbols:
