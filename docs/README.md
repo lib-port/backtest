@@ -7,20 +7,7 @@ observe, recover, and secure it.
 The root [README](../README.md) remains the installation and user quickstart. These documents are
 for maintainers, reviewers, platform engineers, security engineers, and incident responders.
 
-## Documentation map
-
-```mermaid
-flowchart TD
-    Start["Start here"] --> Architecture["Architecture<br/>boundaries, flows, data, invariants"]
-    Start --> Operations["Operations runbook<br/>deploy, observe, triage, recover"]
-    Architecture --> ADR1["ADR 0001<br/>PostgreSQL-authoritative fenced jobs"]
-    Architecture --> ADR2["ADR 0002<br/>Transactional artifact outbox"]
-    Operations --> ADR1
-    Operations --> ADR2
-    Architecture --> Code["Implementation<br/>src/ and Alembic migrations"]
-    Operations --> Infra["Deployment source<br/>Docker Compose and Terraform"]
-```
-
+## Documentation
 | Document | Read it when |
 | --- | --- |
 | [Architecture](architecture.md) | Changing service boundaries, engine semantics, persistence, tenancy, or infrastructure |

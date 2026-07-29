@@ -1,25 +1,5 @@
 # Security policy
 
-## Reporting a vulnerability
-
-Please do not open a public issue for a suspected vulnerability. Use GitHub’s private
-“Report a vulnerability” flow for this repository and include:
-
-- the affected revision and deployment mode;
-- a minimal reproduction or proof of concept;
-- the expected and observed security boundary;
-- any known exposure of credentials, tenant data, or immutable artifacts.
-
-Do not include real customer data or active credentials. Maintainers should acknowledge a
-complete report privately, assess severity, and coordinate remediation and disclosure before
-publishing details.
-
-## Supported versions
-
-Security fixes target the current `main` branch and the most recent release. Operators should
-deploy immutable images by digest and keep PostgreSQL, the base image, and Python dependencies on
-supported patch releases.
-
 ## Security assumptions
 
 - Internet traffic reaches only the TLS Application Load Balancer and WAF.
