@@ -343,7 +343,7 @@ GitHub Actions runs Python 3.11/3.13 quality checks, a PostgreSQL migration and 
 integration test, packaging, dependency auditing, Terraform and Compose validation, a hardened
 container smoke test, Trivy scanning, and CycloneDX SBOM generation.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), the
+See [SECURITY.md](SECURITY.md), the
 [architecture](docs/architecture.md), and the [operations runbook](docs/runbooks/operations.md)
 before changing security, persistence, or deployment boundaries.
 
