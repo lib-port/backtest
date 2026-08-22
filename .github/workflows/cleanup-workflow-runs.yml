@@ -1,0 +1,67 @@
+name: Cleanup workflow runs
+
+on:
+  workflow_run:
+    workflows:
+      - ci
+      - Mirror to GitLab
+      - Dependabot Updates
+    types:
+      - completed
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+concurrency:
+  group: cleanup-workflow-runs
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Delete superseded completed workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          self_workflow_id="$(
+            gh api \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GH_REPO}/actions/workflows/cleanup-workflow-runs.yml" \
+              --jq '.id'
+          )"
+
+          mapfile -t workflow_ids < <(
+            gh api --paginate \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GH_REPO}/actions/workflows?per_page=100" \
+              --jq '.workflows[] | select(.state == "active") | .id'
+          )
+
+          for workflow_id in "${workflow_ids[@]}"; do
+            mapfile -t completed_runs < <(
+              gh api --paginate \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "/repos/${GH_REPO}/actions/workflows/${workflow_id}/runs?status=completed&per_page=100" \
+                --jq '.workflow_runs[] | [.created_at, .id] | @tsv' |
+                sort -t $'\t' -k1,1r -k2,2nr
+            )
+
+            keep_count=1
+            if [[ "${workflow_id}" == "${self_workflow_id}" ]]; then
+              keep_count=0
+            fi
+
+            for ((index = keep_count; index < ${#completed_runs[@]}; index++)); do
+              run_id="${completed_runs[$index]##*$'\t'}"
+              gh api --method DELETE \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "/repos/${GH_REPO}/actions/runs/${run_id}"
+            done
+          done
