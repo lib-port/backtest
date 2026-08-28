@@ -34,7 +34,7 @@ dev = [
   "pytest>=8.0,<10",
   "pytest-cov>=7,<8",
   "ruff>=0.6,<1",
-  "mypy>=1.10,<2",
+  "mypy>=1.10,<3",
   "types-python-dateutil",
   "hypothesis>=6.0,<7",
   "httpx>=0.28,<1",
