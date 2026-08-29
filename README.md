@@ -1,6 +1,6 @@
 # Quant Backtester
 
-[![CI](https://github.com/libport/backtest/actions/workflows/ci.yml/badge.svg)](https://github.com/libport/backtest/actions/workflows/ci.yml)
+[![CI](https://github.com/lib-port/backtest/actions/workflows/ci.yml/badge.svg)](https://github.com/lib-port/backtest/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://github.com/libport/backtest/blob/main/pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/libport/backtest/blob/main/LICENSE)
 
